@@ -1,0 +1,48 @@
+# Logs y depuración
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencias
+node_modules/
+.pnp
+.pnp.js
+
+# Compilación y artefactos TypeScript
+dist/
+build/
+*.tsbuildinfo
+
+# Variables de entorno y secretos locales
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Pruebas y cobertura
+coverage/
+.nyc_output/
+
+# IDEs y Editores
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Temporales y caches
+.cache/
+.temp/
+*.tmp
