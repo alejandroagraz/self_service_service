@@ -1,65 +1,43 @@
 # syntax=docker/dockerfile:1
 #
-# Monorepo Yarn Classic (v1) workspaces: el build context es la raiz del repo (ver
-# infra/docker-compose.dev.yml e infra/docker-compose.staging.yml, que fijan
-# `context: ..` + `dockerfile: workspace/time_service/Dockerfile`) para que `yarn
-# install` resuelva el grafo de workspaces real, igual que en el host. Nunca construir
-# con el contexto apuntando solo a esta carpeta.
+# Repo independiente (tras separar el monorepo Yarn workspaces): el build context es la raiz
+# de ESTE repo. El compose fija `context: ../<svc>_service` + `dockerfile: Dockerfile`.
+# `yarn install` resuelve solo las dependencias de este servicio con su propio yarn.lock;
+# tsconfig.json trae las opciones de compilador inline (ya no extiende un tsconfig.base.json).
 #
-# Orden de stages deliberado: `dev` va inmediatamente despues de `deps` (su unica
-# dependencia). Con el builder clasico de Docker (sin BuildKit, el que usa
-# docker-compose v1.29.2 por defecto), `--target X` igual ejecuta TODAS las stages que
-# aparecen antes de X en el archivo, no solo sus dependencias reales — si `build`
-# (que requiere `src/` real para `tsc`) apareciera antes de `dev`, construir la imagen
-# de dev fallaria mientras el servicio no tenga codigo fuente todavia.
+# Orden de stages deliberado: `dev` va justo despues de `deps` (su unica dependencia). Con el
+# builder clasico de Docker (sin BuildKit, el que usa docker-compose v1.29.2), `--target X`
+# ejecuta TODAS las stages anteriores a X en el archivo; si `build` (que necesita src/ para
+# `tsc`) apareciera antes de `dev`, construir la imagen de dev fallaria.
 
 FROM node:20-alpine AS base
 RUN corepack enable && corepack prepare yarn@1.22.22 --activate
-WORKDIR /repo
+WORKDIR /app
 
 FROM base AS deps
-COPY package.json yarn.lock tsconfig.base.json ./
-COPY workspace/identity_service/package.json workspace/identity_service/package.json
-COPY workspace/people_service/package.json workspace/people_service/package.json
-COPY workspace/payroll_service/package.json workspace/payroll_service/package.json
-COPY workspace/time_service/package.json workspace/time_service/package.json
-COPY workspace/documents_service/package.json workspace/documents_service/package.json
-COPY workspace/notifications_service/package.json workspace/notifications_service/package.json
-COPY workspace/audit_service/package.json workspace/audit_service/package.json
+COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile
 
-# Target usado por docker-compose.dev.yml: dependencias completas (incl. tsx para
-# hot-reload) instaladas en la imagen; en runtime el repo completo se monta por
-# bind-mount (ver volumes en dev), asi que node_modules del host (ya instalado via
-# `yarn install` en la raiz) termina prevaleciendo — este stage solo garantiza que la
-# imagen arranca sola incluso antes del primer `docker compose up`.
+# Target de docker-compose.dev.yml: dependencias completas (incl. tsx para hot-reload). En
+# dev el repo se monta por bind-mount sobre /app, asi que el codigo del host prevalece.
 FROM deps AS dev
-WORKDIR /repo/workspace/time_service
 CMD ["yarn", "dev"]
 
 FROM base AS prod-deps
-COPY package.json yarn.lock tsconfig.base.json ./
-COPY workspace/identity_service/package.json workspace/identity_service/package.json
-COPY workspace/people_service/package.json workspace/people_service/package.json
-COPY workspace/payroll_service/package.json workspace/payroll_service/package.json
-COPY workspace/time_service/package.json workspace/time_service/package.json
-COPY workspace/documents_service/package.json workspace/documents_service/package.json
-COPY workspace/notifications_service/package.json workspace/notifications_service/package.json
-COPY workspace/audit_service/package.json workspace/audit_service/package.json
+COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile --production=true
 
 FROM deps AS build
-COPY workspace/time_service workspace/time_service
-RUN yarn workspace @fibex-rrhh/time build
+COPY . .
+RUN yarn build
 
-# Target usado por docker-compose.staging.yml: build-only, sin bind-mounts. Misma
-# imagen para ROLE=api y ROLE=worker (Worker Node Pattern) — la diferencia la decide
-# src/main.ts leyendo la env var ROLE en runtime, no el Dockerfile.
+# Target de docker-compose.staging.yml: build-only, sin bind-mounts. Misma imagen para
+# ROLE=api y ROLE=worker y para el contenedor efimero de migracion (el ROLE lo decide
+# src/main.ts en runtime; la migracion corre `yarn migration:run:dist`, que invoca el binario
+# typeorm —dependencia de produccion— sobre el .js compilado en dist/).
 FROM base AS runtime
 ENV NODE_ENV=production
-COPY --from=prod-deps /repo/node_modules ./node_modules
-COPY --from=prod-deps /repo/package.json /repo/yarn.lock ./
-COPY workspace/time_service/package.json workspace/time_service/package.json
-COPY --from=build /repo/workspace/time_service/dist workspace/time_service/dist
-WORKDIR /repo/workspace/time_service
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/package.json /app/yarn.lock ./
+COPY --from=build /app/dist ./dist
 CMD ["node", "dist/main.js"]
