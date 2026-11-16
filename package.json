@@ -5,6 +5,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/main.ts",
+    "test": "node --import tsx --test tests/invariants/*.test.ts",
     "start": "node dist/main.js",
     "migration:run": "typeorm-ts-node-commonjs migration:run -d src/shared/infrastructure/database/migration-data-source.ts",
     "migration:run:dist": "typeorm migration:run -d dist/shared/infrastructure/database/migration-data-source.js",
