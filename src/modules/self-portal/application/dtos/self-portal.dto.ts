@@ -1,6 +1,10 @@
 import { IsIn, IsOptional, IsString, MaxLength } from "class-validator";
 
-import { CLOCK_ACTIONS, type ClockAction, type ClockStatus } from "../../domain/services/clock-status";
+import {
+  CLOCK_ACTIONS,
+  type ClockAction,
+  type ClockStatus,
+} from "../../domain/services/clock-status";
 
 /**
  * Cuerpo de `POST /me/clock-punch`. `whitelist`/`forbidNonWhitelisted` (ver `validate-dto.ts`)
@@ -47,4 +51,58 @@ export interface ClockPunchResultDto {
   readonly status: ClockStatus;
   readonly timestamp: string;
   readonly message: string;
+}
+
+/** Tipo de celebración expuesto por el BFF (`GET /me/celebrations`). */
+export type CelebrationType = "BIRTHDAY" | "WORK_ANNIVERSARY";
+
+/** Un ítem de celebración (cumpleaños / aniversario) para la vista de equipo del portal. */
+export interface EmployeeCelebrationDto {
+  readonly employeeId: string;
+  readonly fullName: string;
+  readonly departmentName: string;
+  readonly type: CelebrationType;
+  readonly month: number;
+  readonly day: number;
+  readonly date: string;
+  /** Años de empresa en un aniversario; `null` para cumpleaños (no se expone la edad). */
+  readonly years: number | null;
+}
+
+/** Resumen de puntualidad mensual del empleado (`GET /me/punctuality`). */
+export interface EmployeePunctualityDto {
+  readonly employeeId: string;
+  readonly month: string;
+  readonly totalDays: number;
+  readonly onTimeDays: number;
+  readonly lateDays: number;
+  readonly earlyDepartureDays: number;
+  readonly totalDelayMinutes: number;
+  readonly punctualityRate: number;
+  readonly graceMinutes: number;
+}
+
+/** Miembro del equipo (vista de manager, `GET /me/team-status`). */
+export interface TeamMemberSummaryDto {
+  readonly employeeId: string;
+  readonly fullName: string;
+}
+
+/** Miembro del equipo ausente hoy (vista de manager, `GET /me/team-status`). */
+export interface AbsentTeamMemberSummaryDto {
+  readonly employeeId: string;
+  readonly fullName: string;
+  readonly category: string;
+  readonly startDate: string;
+  readonly endDate: string;
+  readonly returnDate: string;
+}
+
+/** Estado del equipo del manager hoy (`GET /me/team-status`). */
+export interface TeamStatusViewDto {
+  readonly managerEmployeeId: string;
+  readonly date: string;
+  readonly teamSize: number;
+  readonly notCheckedIn: readonly TeamMemberSummaryDto[];
+  readonly absentToday: readonly AbsentTeamMemberSummaryDto[];
 }

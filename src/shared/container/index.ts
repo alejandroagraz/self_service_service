@@ -18,6 +18,7 @@ import { AbsencesClient } from "../infrastructure/http/absences-client";
 import { IdentityClient } from "../infrastructure/http/identity-client";
 import { PayrollClient } from "../infrastructure/http/payroll-client";
 import { PeopleClient } from "../infrastructure/http/people-client";
+import { PeopleInternalClient } from "../infrastructure/http/people-internal-client";
 import { TimeClient } from "../infrastructure/http/time-client";
 import { DayjsClock } from "../infrastructure/services/dayjs-clock";
 import { UuidV4IdGenerator } from "../infrastructure/services/uuid-v4-id-generator";
@@ -62,13 +63,25 @@ export const registerIdentityClient = (
  * Registra los clientes SALIENTES hacia los hermanos. Lo llama `buildHttpServer` tras leer las claves
  * per-pair (`http-secrets.ts`); el rol worker no lo llama (no sirve HTTP ni compone vistas).
  *
- * `people` es pass-through del token del usuario (sin clave); `payroll`/`absences`/`time` son de
+ * `people` (pass-through) reenvía el token del usuario (sin clave); `payroll`/`absences`/`time` son de
  * confianza per-pair, cada uno con SU clave dedicada. Todos comparten el timeout de upstream.
+ *
+ * `PeopleInternalClient` es el canal trusted-service hacia people (`/api/v1/people/internal/*`:
+ * celebraciones y estado del equipo). El proceso fusionado `people` sirve los tres dominios
+ * (people/time/absences) y valida TODAS sus rutas internas contra la ÚNICA clave de lectura per-caller
+ * de `self-service`; esa misma clave ya llega al proceso fusionado por `active-shift` (canal `time`),
+ * así que se REUTILIZA `secrets.timeReadKey` para estas rutas del prefijo people. No se crea secreto
+ * nuevo. (Deuda: `env.ts`/infra podrían converger las tres claves de lectura en una sola clave
+ * `people` para reflejar la fusión; fuera de alcance aquí.)
  */
 export const registerOutboundClients = (secrets: HttpSecrets): void => {
   container.registerInstance(
     TOKENS.PeopleClient,
     new PeopleClient(env.PEOPLE_INTERNAL_URL, env.UPSTREAM_TIMEOUT_MS),
+  );
+  container.registerInstance(
+    TOKENS.PeopleInternalClient,
+    new PeopleInternalClient(env.PEOPLE_INTERNAL_URL, secrets.timeReadKey, env.UPSTREAM_TIMEOUT_MS),
   );
   container.registerInstance(
     TOKENS.PayrollClient,

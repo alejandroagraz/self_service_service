@@ -2,7 +2,9 @@
  * Rutas del portal del colaborador (prefijo `/api/v1/self-service`, aplicado en `server.ts`).
  * Expuestas por Traefik y de cara al usuario autenticado. Cada una exige token válido (`authenticate`)
  * y el permiso correspondiente del catálogo de identity:
- *   - lecturas (`/me/profile`, `/me/payslips`): `self_service:read`.
+ *   - lecturas del propio empleado (`/me/profile`, `/me/payslips`, `/me/celebrations`,
+ *     `/me/punctuality`): `self_service:read`.
+ *   - lectura de manager (`/me/team-status`): `team:read` (si falta, el preHandler responde 403).
  *   - escritura (`/me/clock-punch`): `self_service:punch`.
  *
  * La ruta solo declara método, path y hooks, y delega en el controller resuelto del contenedor.
@@ -35,5 +37,23 @@ export const registerSelfPortalRoutes = (app: FastifyInstance): void => {
     "/me/clock-punch",
     { preHandler: [authenticate, requirePermission("self_service:punch")] },
     (request, reply) => controller.punch(request, reply),
+  );
+
+  app.get(
+    "/me/celebrations",
+    { preHandler: [authenticate, requirePermission("self_service:read")] },
+    (request, reply) => controller.celebrations(request, reply),
+  );
+
+  app.get(
+    "/me/punctuality",
+    { preHandler: [authenticate, requirePermission("self_service:read")] },
+    (request, reply) => controller.punctuality(request, reply),
+  );
+
+  app.get(
+    "/me/team-status",
+    { preHandler: [authenticate, requirePermission("team:read")] },
+    (request, reply) => controller.teamStatus(request, reply),
   );
 };

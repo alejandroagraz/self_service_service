@@ -23,6 +23,9 @@ export const TOKENS = {
   // Clientes SALIENTES hacia los servicios hermanos (puertos del módulo self-portal). Solo el rol
   // HTTP los registra (`registerOutboundClients`), tras leer las claves per-pair; el worker no.
   PeopleClient: Symbol.for("IPeopleClient"),
+  // Canal trusted-service hacia people (`/api/v1/people/internal/*`): distinto del pass-through
+  // `PeopleClient`. Sirve celebraciones y estado del equipo con clave de lectura per-caller.
+  PeopleInternalClient: Symbol.for("IPeopleInternalClient"),
   PayrollClient: Symbol.for("IPayrollClient"),
   AbsencesClient: Symbol.for("IAbsencesClient"),
   TimeClient: Symbol.for("ITimeClient"),
