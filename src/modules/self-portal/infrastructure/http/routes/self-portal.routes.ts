@@ -45,6 +45,24 @@ export const registerSelfPortalRoutes = (app: FastifyInstance): void => {
     (request, reply) => controller.celebrations(request, reply),
   );
 
+  app.post(
+    "/me/celebrations/greet",
+    { preHandler: [authenticate, requirePermission("self_service:read")] },
+    (request, reply) => controller.greet(request, reply),
+  );
+
+  app.delete(
+    "/me/celebrations/greet",
+    { preHandler: [authenticate, requirePermission("self_service:read")] },
+    (request, reply) => controller.ungreet(request, reply),
+  );
+
+  app.get(
+    "/me/absences",
+    { preHandler: [authenticate, requirePermission("self_service:read")] },
+    (request, reply) => controller.absences(request, reply),
+  );
+
   app.get(
     "/me/punctuality",
     { preHandler: [authenticate, requirePermission("self_service:read")] },

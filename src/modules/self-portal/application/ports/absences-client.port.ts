@@ -12,6 +12,22 @@ export interface LeaveBalanceDto {
   readonly pendingDays: number;
 }
 
+/** Una ausencia del empleado dentro del mes consultado (para pintar el calendario del portal). */
+export interface EmployeeMonthAbsenceDto {
+  readonly category: string;
+  readonly startDate: string;
+  readonly endDate: string;
+}
+
 export interface IAbsencesClient {
   getLeaveBalance(tenantId: string, employeeId: string): Promise<LeaveBalanceDto>;
+  /**
+   * Ausencias del empleado dentro de `month` (`AAAA-MM`). PRIMARIO de `GET /me/absences`: su caída
+   * SÍ rompe ese endpoint (503). `month` lo acota el llamador; no reenvía el token del usuario.
+   */
+  getEmployeeMonthAbsences(
+    tenantId: string,
+    employeeId: string,
+    month: string,
+  ): Promise<readonly EmployeeMonthAbsenceDto[]>;
 }

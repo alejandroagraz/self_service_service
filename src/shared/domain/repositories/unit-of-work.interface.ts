@@ -25,12 +25,15 @@
  * (excepción única documentada en su cabecera y en el rulebook §11.2), porque `outbox_events` no
  * lleva RLS y un poller global lee filas de todos los tenants en un mismo lote.
  */
+import type { ICelebrationGreetingRepository } from "../../../modules/self-portal/domain/repositories/celebration-greeting-repository.interface";
 import type { IClockPunchRepository } from "../../../modules/self-portal/domain/repositories/clock-punch-repository.interface";
 import type { IOutboxRepository } from "./outbox-repository.interface";
 
 export interface IRepositoryRegistry {
   /** Tabla POR-TENANT (RLS), append-only. */
   readonly clockPunches: IClockPunchRepository;
+  /** Tabla POR-TENANT (RLS): felicitaciones sociales del portal. */
+  readonly celebrationGreetings: ICelebrationGreetingRepository;
   /** Tabla sin RLS (el `tenant_id` del evento se pasa explícito). */
   readonly outbox: IOutboxRepository;
 }

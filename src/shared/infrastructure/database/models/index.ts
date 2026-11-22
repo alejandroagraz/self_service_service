@@ -7,9 +7,10 @@
  * NO hay `ProcessedEventModel`: `self_service` no consume eventos, así que no necesita tabla de
  * idempotencia de entrada.
  */
+import { CelebrationGreetingModel } from "./celebration-greeting.model";
 import { ClockPunchModel } from "./clock-punch.model";
 import { OutboxEventModel } from "./outbox-event.model";
 
-export const SELF_SERVICE_MODELS = [ClockPunchModel, OutboxEventModel];
+export const SELF_SERVICE_MODELS = [ClockPunchModel, OutboxEventModel, CelebrationGreetingModel];
 
-export { ClockPunchModel, OutboxEventModel };
+export { CelebrationGreetingModel, ClockPunchModel, OutboxEventModel };

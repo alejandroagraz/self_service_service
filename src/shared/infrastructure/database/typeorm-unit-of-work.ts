@@ -20,6 +20,7 @@
 import { injectable, inject } from "tsyringe";
 import type { DataSource, EntityManager, QueryRunner } from "typeorm";
 
+import { TypeOrmCelebrationGreetingRepository } from "../../../modules/self-portal/infrastructure/repositories/typeorm-celebration-greeting.repository";
 import { TypeOrmClockPunchRepository } from "../../../modules/self-portal/infrastructure/repositories/typeorm-clock-punch.repository";
 import type { IIdGenerator } from "../../domain/services/id-generator.interface";
 import type {
@@ -79,6 +80,7 @@ export class TypeOrmUnitOfWork implements IUnitOfWork {
   private buildRegistry(manager: EntityManager): IRepositoryRegistry {
     return {
       clockPunches: new TypeOrmClockPunchRepository(manager),
+      celebrationGreetings: new TypeOrmCelebrationGreetingRepository(manager),
       outbox: new TypeOrmOutboxRepository(manager, this.idGenerator),
     };
   }

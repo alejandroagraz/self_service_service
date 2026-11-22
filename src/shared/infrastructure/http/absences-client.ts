@@ -12,6 +12,7 @@
  * La clave NUNCA se escribe en logs ni errores.
  */
 import type {
+  EmployeeMonthAbsenceDto,
   IAbsencesClient,
   LeaveBalanceDto,
 } from "../../../modules/self-portal/application/ports/absences-client.port";
@@ -31,6 +32,22 @@ import {
 const log = childLogger("absences-client");
 const SERVICE_SLUG = "self-service";
 const BALANCE_PATH = "/api/v1/absences/internal/leave-balance";
+const MONTH_ABSENCES_PATH = "/api/v1/absences/internal/employee-month-absences";
+
+/** Mapea una fila a `EmployeeMonthAbsenceDto`, o `null` si le falta un campo clave (se descarta). */
+const parseMonthAbsence = (raw: unknown): EmployeeMonthAbsenceDto | null => {
+  if (typeof raw !== "object" || raw === null) {
+    return null;
+  }
+  const r = raw as Record<string, unknown>;
+  const category = asString(r.category);
+  const startDate = asString(r.startDate);
+  const endDate = asString(r.endDate);
+  if (category === null || startDate === null || endDate === null) {
+    return null;
+  }
+  return { category, startDate, endDate };
+};
 
 const parseBalance = (data: unknown, employeeId: string): LeaveBalanceDto | null => {
   if (typeof data !== "object" || data === null) {
@@ -86,6 +103,49 @@ export class AbsencesClient implements IAbsencesClient {
       });
     } catch (error) {
       log.error("absences no pudo devolver el saldo de ausencias del empleado.", {
+        status: error instanceof UpstreamError ? error.status : undefined,
+      });
+      throw fail("SELF_UPSTREAM_UNAVAILABLE");
+    }
+  }
+
+  async getEmployeeMonthAbsences(
+    tenantId: string,
+    employeeId: string,
+    month: string,
+  ): Promise<readonly EmployeeMonthAbsenceDto[]> {
+    const url =
+      `${this.baseUrl}${MONTH_ABSENCES_PATH}` +
+      `?employeeId=${encodeURIComponent(employeeId)}&month=${encodeURIComponent(month)}`;
+    try {
+      return await withTransientRetry(rootLogger(), "absences:getEmployeeMonthAbsences", async () => {
+        const response = await fetchOnce({
+          url,
+          method: "GET",
+          headers: {
+            "x-service-name": SERVICE_SLUG,
+            "x-internal-api-key": this.internalApiKey,
+            "x-tenant-id": tenantId,
+          },
+          timeoutMs: this.timeoutMs,
+        });
+        if (response.status === 200) {
+          const body = (await safeJson(response)) as { data?: unknown } | null;
+          if (!Array.isArray(body?.data)) {
+            throw new UpstreamError("absences devolvió un cuerpo ilegible.", false, 200);
+          }
+          return body.data
+            .map(parseMonthAbsence)
+            .filter((item): item is EmployeeMonthAbsenceDto => item !== null);
+        }
+        throw new UpstreamError(
+          `absences respondió ${String(response.status)} en /internal/employee-month-absences.`,
+          isRetryableStatus(response.status),
+          response.status,
+        );
+      });
+    } catch (error) {
+      log.error("absences no pudo devolver las ausencias del mes del empleado.", {
         status: error instanceof UpstreamError ? error.status : undefined,
       });
       throw fail("SELF_UPSTREAM_UNAVAILABLE");

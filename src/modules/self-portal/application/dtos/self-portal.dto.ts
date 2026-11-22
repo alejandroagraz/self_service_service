@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString, MaxLength } from "class-validator";
+import { IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength } from "class-validator";
 
 import {
   CLOCK_ACTIONS,
@@ -67,6 +67,49 @@ export interface EmployeeCelebrationDto {
   readonly date: string;
   /** Años de empresa en un aniversario; `null` para cumpleaños (no se expone la edad). */
   readonly years: number | null;
+  /** Número de felicitaciones que ha recibido esta celebración. */
+  readonly greetingCount: number;
+  /** `true` si el usuario autenticado ya felicitó esta celebración. */
+  readonly greetedByMe: boolean;
+  /** Nombres (distintos) de quienes felicitaron, como máximo 5. */
+  readonly greeters: readonly string[];
+}
+
+/**
+ * Estado social de una celebración concreta (`POST`/`DELETE /me/celebrations/greet`). Describe las
+ * felicitaciones de la celebración de `celebrantEmployeeId` en `date` tras la operación.
+ */
+export interface CelebrationGreetingStateDto {
+  readonly celebrantEmployeeId: string;
+  readonly date: string;
+  readonly greetingCount: number;
+  readonly greetedByMe: boolean;
+  readonly greeters: readonly string[];
+}
+
+/**
+ * Cuerpo de `POST /me/celebrations/greet`. `whitelist`/`forbidNonWhitelisted` (ver `validate-dto.ts`)
+ * descartan campos no declarados. `date` es la fecha de la celebración (`AAAA-MM-DD`), no la de
+ * nacimiento.
+ */
+export class GreetCelebrationRequestDto {
+  @IsUUID()
+  celebrantEmployeeId!: string;
+
+  @IsIn(["BIRTHDAY", "WORK_ANNIVERSARY"], {
+    message: "type debe ser una de: BIRTHDAY, WORK_ANNIVERSARY.",
+  })
+  type!: string;
+
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, {
+    message: "date debe tener formato AAAA-MM-DD.",
+  })
+  date!: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(280)
+  message?: string;
 }
 
 /** Resumen de puntualidad mensual del empleado (`GET /me/punctuality`). */
@@ -80,6 +123,15 @@ export interface EmployeePunctualityDto {
   readonly totalDelayMinutes: number;
   readonly punctualityRate: number;
   readonly graceMinutes: number;
+  /** Minutos trabajados hoy (día civil UTC), derivados de las marcaciones de reloj. Entero >= 0. */
+  readonly workedMinutesToday: number;
+}
+
+/** Un ítem de ausencia del mes del empleado para el calendario (`GET /me/absences`). */
+export interface MyMonthAbsenceDto {
+  readonly category: string;
+  readonly startDate: string;
+  readonly endDate: string;
 }
 
 /** Miembro del equipo (vista de manager, `GET /me/team-status`). */

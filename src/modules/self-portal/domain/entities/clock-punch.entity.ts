@@ -74,6 +74,10 @@ export class ClockPunch {
     return this.state.id;
   }
 
+  get employeeId(): string {
+    return this.state.employeeId;
+  }
+
   get action(): ClockAction {
     return this.state.action;
   }

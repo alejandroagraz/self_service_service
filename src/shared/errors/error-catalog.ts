@@ -112,6 +112,13 @@ export const ERRORS = define({
     message: "La acción de marcación no es válida para su estado de jornada actual.",
     statusCode: 409,
   },
+
+  // ===== CGR — celebration greetings (felicitaciones sociales del portal, por tenant) =====
+  CELEBRATION_GREETING_INVALID: {
+    code: "SSVCGR0001",
+    message: "La felicitación no es válida.",
+    statusCode: 422,
+  },
 });
 
 export type ErrorKey = keyof typeof ERRORS;
