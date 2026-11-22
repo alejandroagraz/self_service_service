@@ -9,14 +9,20 @@ import type { ITimeClient } from "../ports/time-client.port";
 import type { EmployeePunctualityDto } from "../dtos/self-portal.dto";
 
 const MS_PER_MINUTE = 60_000;
+/**
+ * Venezuela usa UTC-4 fijo (sin horario de verano): el día/mes civil del empleado se calcula con este
+ * desfase, no en UTC, para que "hoy" no se corra cerca de la medianoche local.
+ */
+const VET_UTC_OFFSET_MINUTES = -240;
 
 /**
  * Compone `GET /me/punctuality`: resuelve el `employeeId` del usuario autenticado vía people
  * (pass-through del token, igual que `get-my-profile`/`list-my-payslips`) y pide a time el resumen de
  * puntualidad de ese empleado para el mes indicado. `month` es opcional; por defecto el mes corriente.
  *
- * El servicio razona en UTC (ver `dayjs-clock.ts`); el default del mes corriente se deriva en UTC. El
- * frontend, que conoce el huso del usuario, puede fijar `?month=AAAA-MM` explícito cuando lo necesite.
+ * El default del mes corriente y la ventana de "horas de hoy" se derivan en hora de Venezuela (UTC-4,
+ * sin horario de verano). El frontend, que conoce el huso del usuario, puede fijar `?month=AAAA-MM`
+ * explícito cuando lo necesite.
  */
 @injectable()
 export class GetMyPunctualityUseCase {
@@ -37,9 +43,11 @@ export class GetMyPunctualityUseCase {
     const punctuality = await this.time.getPunctuality(tenantId, profile.employeeId, resolvedMonth);
 
     // "Horas de hoy": se deriva de las marcaciones propias (RLS), no del resumen mensual de `time`.
-    const today = this.currentDay();
+    // La ventana es el DÍA CIVIL LOCAL de Venezuela (UTC-4), expresada como instantes UTC, para no
+    // contar el día equivocado cerca de la medianoche local.
+    const { start, end } = this.localDayWindow();
     const punches = await this.uow.withTenant(tenantId, (repos) =>
-      repos.clockPunches.findPunchesOnDate(profile.employeeId, today),
+      repos.clockPunches.findPunchesInRange(profile.employeeId, start, end),
     );
     const workedMinutesToday = this.workedMinutesFrom(punches);
 
@@ -81,20 +89,24 @@ export class GetMyPunctualityUseCase {
     return minutes > 0 ? minutes : 0;
   }
 
-  /** Mes corriente en UTC, `AAAA-MM`. */
+  /** Mes civil corriente en hora de Venezuela (UTC-4), `AAAA-MM`. */
   private currentMonth(): string {
-    const now = this.clock.now();
-    const year = now.getUTCFullYear();
-    const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+    const local = new Date(this.clock.now().getTime() + VET_UTC_OFFSET_MINUTES * MS_PER_MINUTE);
+    const year = local.getUTCFullYear();
+    const month = String(local.getUTCMonth() + 1).padStart(2, "0");
     return `${String(year)}-${month}`;
   }
 
-  /** Día corriente en UTC, `AAAA-MM-DD`. */
-  private currentDay(): string {
-    const now = this.clock.now();
-    const year = now.getUTCFullYear();
-    const month = String(now.getUTCMonth() + 1).padStart(2, "0");
-    const day = String(now.getUTCDate()).padStart(2, "0");
-    return `${String(year)}-${month}-${day}`;
+  /**
+   * Ventana `[start, end)` (instantes UTC) del día civil corriente en hora de Venezuela (UTC-4). La
+   * medianoche local se convierte a UTC restando el desfase (negativo): medianoche VET
+   * `AAAA-MM-DD 00:00 -04:00` = `AAAA-MM-DD 04:00Z`.
+   */
+  private localDayWindow(): { start: Date; end: Date } {
+    const local = new Date(this.clock.now().getTime() + VET_UTC_OFFSET_MINUTES * MS_PER_MINUTE);
+    const startMs =
+      Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) -
+      VET_UTC_OFFSET_MINUTES * MS_PER_MINUTE;
+    return { start: new Date(startMs), end: new Date(startMs + 24 * 60 * MS_PER_MINUTE) };
   }
 }

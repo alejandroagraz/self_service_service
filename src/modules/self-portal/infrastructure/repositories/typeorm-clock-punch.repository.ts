@@ -30,16 +30,18 @@ export class TypeOrmClockPunchRepository implements IClockPunchRepository {
     return model === null ? null : model.punchedAt;
   }
 
-  async findPunchesOnDate(employeeId: string, ymd: string): Promise<readonly ClockPunch[]> {
-    // Rango semiabierto en UTC `[ymd 00:00, día siguiente 00:00)`: así una marcación a las 23:59:59
-    // del día entra y la de las 00:00 del día siguiente queda fuera, sin depender del huso del motor.
-    const start = new Date(`${ymd}T00:00:00.000Z`);
-    const next = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  async findPunchesInRange(
+    employeeId: string,
+    startInclusive: Date,
+    endExclusive: Date,
+  ): Promise<readonly ClockPunch[]> {
+    // Rango semiabierto `[startInclusive, endExclusive)` por instantes UTC: la ventana (p. ej. el día
+    // civil local de Venezuela) la calcula el caso de uso; aquí solo se filtra por `punched_at`.
     const models = await this.manager
       .createQueryBuilder(ClockPunchModel, "cp")
       .where("cp.employeeId = :employeeId", { employeeId })
-      .andWhere("cp.punchedAt >= :start", { start })
-      .andWhere("cp.punchedAt < :next", { next })
+      .andWhere("cp.punchedAt >= :start", { start: startInclusive })
+      .andWhere("cp.punchedAt < :end", { end: endExclusive })
       .orderBy("cp.punchedAt", "ASC")
       .addOrderBy("cp.id", "ASC")
       .getMany();

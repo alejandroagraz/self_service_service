@@ -11,11 +11,16 @@ export interface IClockPunchRepository {
   /** El `punched_at` de la última marcación CHECK_IN del empleado, o `null`. */
   findLastCheckInAt(employeeId: string): Promise<Date | null>;
   /**
-   * Marcaciones del empleado cuyo `punched_at` cae en el día civil `ymd` (UTC, `AAAA-MM-DD`),
-   * ordenadas ASC por `punchedAt` (desempate por `id` ASC). Rango semiabierto `[00:00, 00:00 del
-   * día siguiente)`. Vacío si el empleado no fichó ese día.
+   * Marcaciones del empleado con `punched_at` en el rango semiabierto `[startInclusive, endExclusive)`
+   * (instantes UTC), ordenadas ASC por `punchedAt` (desempate por `id` ASC). Vacío si no fichó en ese
+   * rango. Quien llama define la ventana (p. ej. el día civil local de Venezuela, UTC-4): el repo no
+   * conoce el huso de negocio, solo filtra por instantes.
    */
-  findPunchesOnDate(employeeId: string, ymd: string): Promise<readonly ClockPunch[]>;
+  findPunchesInRange(
+    employeeId: string,
+    startInclusive: Date,
+    endExclusive: Date,
+  ): Promise<readonly ClockPunch[]>;
   /** Inserta una marcación nueva (append-only). */
   save(punch: ClockPunch): Promise<void>;
 }

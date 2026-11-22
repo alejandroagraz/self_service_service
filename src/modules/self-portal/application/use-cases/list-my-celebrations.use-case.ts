@@ -2,6 +2,7 @@ import { inject, injectable } from "tsyringe";
 
 import { TOKENS } from "../../../../shared/container/tokens";
 import type { IUnitOfWork } from "../../../../shared/domain/repositories/unit-of-work.interface";
+import type { ILogger } from "../../../../shared/domain/services/logger.interface";
 import type { CelebrationGreeting } from "../../domain/entities/celebration-greeting.entity";
 import type { IPeopleInternalClient } from "../ports/people-internal-client.port";
 import type { EmployeeCelebrationDto } from "../dtos/self-portal.dto";
@@ -32,6 +33,7 @@ export class ListMyCelebrationsUseCase {
   constructor(
     @inject(TOKENS.PeopleInternalClient) private readonly people: IPeopleInternalClient,
     @inject(TOKENS.UnitOfWork) private readonly uow: IUnitOfWork,
+    @inject(TOKENS.Logger) private readonly log: ILogger,
   ) {}
 
   async execute(
@@ -45,10 +47,21 @@ export class ListMyCelebrationsUseCase {
     }
 
     const celebrantIds = [...new Set(celebrations.map((c) => c.employeeId))];
-    const greetings = await this.uow.withTenant(tenantId, (repos) =>
-      repos.celebrationGreetings.listByCelebrantIds(celebrantIds),
-    );
-    const aggregates = this.aggregate(greetings, authorUserId);
+    // La capa social (felicitaciones) es SECUNDARIA: su caída NO debe romper las celebraciones. Si la
+    // lectura falla, se degrada a "sin felicitaciones" (contador 0, nadie), igual que el saldo de
+    // ausencias degrada el perfil (ver `get-my-profile`/`absences-client`).
+    let aggregates: ReadonlyMap<string, GreetingAggregate> = new Map();
+    try {
+      const greetings = await this.uow.withTenant(tenantId, (repos) =>
+        repos.celebrationGreetings.listByCelebrantIds(celebrantIds),
+      );
+      aggregates = this.aggregate(greetings, authorUserId);
+    } catch (error) {
+      this.log.warn(
+        "No se pudo leer la capa social de celebraciones; se degrada a sin felicitaciones.",
+        { error: error instanceof Error ? error.message : String(error) },
+      );
+    }
 
     return celebrations.map((c) => {
       const social = aggregates.get(keyOf(c.employeeId, c.date));
