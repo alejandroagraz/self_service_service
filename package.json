@@ -11,6 +11,9 @@
     "migration:run:dist": "typeorm migration:run -d dist/shared/infrastructure/database/migration-data-source.js",
     "migration:revert": "typeorm-ts-node-commonjs migration:revert -d src/shared/infrastructure/database/migration-data-source.ts",
     "migration:show": "typeorm-ts-node-commonjs migration:show -d src/shared/infrastructure/database/migration-data-source.ts",
+    "//seed": "Seeder multi-tenant (datos QA/demo) del schema self_service. Corre como migrator_self_service (RLS-exempt). faker debe estar en dependencies para seed:dist en contenedor.",
+    "seed": "tsx src/shared/infrastructure/database/seeding/seed.ts",
+    "seed:dist": "node dist/shared/infrastructure/database/seeding/seed.js",
     "lint": "eslint .",
     "format": "prettier --write ."
   },
