@@ -17,8 +17,12 @@ ruta `/internal/*` ni registra preHandler de "servicio de confianza" entrante.
 | Método | Ruta | Permiso | Compone |
 |---|---|---|---|
 | GET | `/api/v1/self-service/me/profile` | `self_service:read` | people + absences + time + clock_punches |
+| GET | `/api/v1/self-service/me/clock-status` | `self_service:read` | people + time (`active-shift`) + clock_punches |
 | GET | `/api/v1/self-service/me/payslips` | `self_service:read` | people + payroll |
-| POST | `/api/v1/self-service/me/clock-punch` | `self_service:punch` | people + clock_punches (propio) + Outbox |
+| POST | `/api/v1/self-service/me/clock-punch` | `self_service:punch` | people + time (`active-shift`) + clock_punches (propio) + Outbox |
+
+Ruta de red interna (sin autenticación, como `/metrics`; **Traefik debe excluirla** porque cuelga del
+prefijo público): `GET /api/v1/self-service/docs/openapi.json`, el OpenAPI publicado (DEC-16 = A).
 
 El principal verificado trae `userId`, no `employeeId`. **El `employeeId` se resuelve SIEMPRE vía
 people** (único dueño del vínculo `userId↔empleado`) antes de consultar a los demás.
@@ -41,8 +45,11 @@ el servidor HTTP (`http-secrets.ts`), 43 chars base64url, fail-fast. Nunca se es
 - Fuente **PRIMARIA** de `/me/profile`: people. Si falla, el perfil falla (no hay empleado que
   mostrar); el error se mapea al usuario (401/403/404 → `SELF_PROFILE_NOT_LINKED`, 5xx/red →
   `SELF_UPSTREAM_UNAVAILABLE`).
-- Fuentes **SECUNDARIAS**: absences (días de vacaciones) y time (turno activo). Su caída NO rompe el
-  perfil: degradan a `vacationDaysAvailable = 0` y `activeShiftName = "Sin turno asignado"`.
+- Fuentes **SECUNDARIAS** del perfil: absences (días de vacaciones) y time (turno activo). Su caída
+  NO rompe el perfil: degradan a `vacationDaysAvailable = 0`, `activeShiftName = "Sin turno asignado"`
+  y estado de jornada sobre el día natural VET.
+- time (`active-shift`) es **PRIMARIO** de `GET /me/clock-status` y de `POST /me/clock-punch`: sin el
+  turno no hay ventana que validar, así que su caída responde 503 `SSVSLF0002` (fail-closed).
 - Toda llamada saliente usa el núcleo `internal-http.ts`: timeout por `AbortController`, backoff
   exponencial con jitter y reintento SOLO ante fallo transitorio (429/5xx/red). Un 4xx de contrato no
   se reintenta.
@@ -51,13 +58,38 @@ el servidor HTTP (`http-secrets.ts`), 43 chars base64url, fail-fast. Nunca se es
 
 - `clock_punches` es POR-TENANT (`tenant_id` + RLS) y **APPEND-ONLY**: privilegios `SELECT, INSERT`
   (sin UPDATE/DELETE a nivel de PostgreSQL — el "append-only" es un invariante del esquema, no una
-  convención). El estado de jornada NO se persiste: se **deriva** de la última marcación.
+  convención). El estado de jornada NO se persiste: se **deriva** de las marcaciones del **día
+  operativo** vigente (`domain/services/operational-day.ts`, GAP-003), la MISMA función para
+  `clock-status`, `profile` y `clock-punch`:
+  - ventana del turno asignado `[inicio − checkInWindowBeforeMinutes, min(fin + abandonAfterMinutes,
+    apertura del turno siguiente))`, que cruza medianoche; sin turno ese día, día natural VET;
+  - vigente: la ventana que contiene `now`; si no y HOY hay turno (alguna asignación con `workDate`
+    = día civil VET), la siguiente asignación que aún no abrió (hoy o mañana) o, si no hay ninguna,
+    la última de hoy ya vencida; el día natural rige SOLO si hoy no hay ningún turno asignado;
+  - fuera de ventana un día con turno el estado es `NOT_STARTED` (no cuenta ninguna marcación): una
+    salida tardía tras `abandonAt` da `409 SSVCLK0002` y la regulariza RRHH (GAP-043, Lote 4.4);
+  - un día con turno, `CHECK_IN` fuera de ventana → `409 SSVCLK0003` con `errors[{field:"opensAt"}]`
+    (próxima apertura) o `errors: []` si no hay turno siguiente en el horizonte; una entrada sin
+    cerrar de una ventana vencida no cuenta y no bloquea la siguiente;
+  - los parámetros (ventana previa, abandono, tolerancias) llegan de people por `active-shift`; con
+    el contrato antiguo (`{ shiftName }`) se usan los valores por defecto de 01B y un `warn`.
 - Acciones: `CHECK_IN | BREAK | CHECK_OUT`. Estados: `NOT_STARTED | CLOCKED_IN | ON_BREAK |
   CLOCKED_OUT`. Transiciones válidas (`clock-status.ts`):
   - `NOT_STARTED`/`CLOCKED_OUT` → solo `CHECK_IN`.
   - `CLOCKED_IN` → `BREAK` o `CHECK_OUT`.
   - `ON_BREAK` → `CHECK_IN` (reanudar) o `CHECK_OUT`.
   Una transición imposible se rechaza con `409 CLOCK_PUNCH_INVALID_TRANSITION` ANTES de escribir.
+
+## OpenAPI (DEC-16 = A, modo transitorio)
+
+- Las rutas nuevas o modificadas declaran `schema` con `routeSchema()`
+  (`shared/infrastructure/http/openapi/route-schema.ts`), generado de los DTO class-validator con
+  `class-validator-jsonschema`, con `operationId`, `tags`, `security` y `x-permission` (clave real de
+  `requirePermission`, `public` o `internal`; las internas con `x-internal: true`).
+- Los esquemas son SOLO documentación: validador y serializador de Fastify desactivados;
+  class-validator sigue dando el 422.
+- `tests/contract/openapi-drift.test.ts` + `openapi-allowlist.json` (solo crece; el Lote 6.1 pasa a
+  modo `strict`).
 - Cada fichaje se inserta y encola el evento `attendance.punched` en el **MISMO COMMIT**
   (Transactional Outbox). `time` lo conciliará como consumo de Fase posterior; hoy `self_service` es
   el dueño del registro de fichaje.

@@ -112,6 +112,14 @@ export const ERRORS = define({
     message: "La acción de marcación no es válida para su estado de jornada actual.",
     statusCode: 409,
   },
+  // Entrada (CHECK_IN) fuera de la ventana del turno un día con turno asignado (GAP-003). El detalle
+  // `opensAt` lleva el instante ISO de la próxima apertura (`inicio − ventana previa`) cuando se
+  // conoce; sin turno siguiente en el horizonte, `errors` va vacío.
+  CLOCK_PUNCH_OUTSIDE_SHIFT_WINDOW: {
+    code: "SSVCLK0003",
+    message: "No se puede marcar la entrada fuera de la ventana de su turno.",
+    statusCode: 409,
+  },
 
   // ===== CGR — celebration greetings (felicitaciones sociales del portal, por tenant) =====
   CELEBRATION_GREETING_INVALID: {

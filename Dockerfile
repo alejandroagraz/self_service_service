@@ -10,7 +10,7 @@
 # ejecuta TODAS las stages anteriores a X en el archivo; si `build` (que necesita src/ para
 # `tsc`) apareciera antes de `dev`, construir la imagen de dev fallaria.
 
-FROM node:20-alpine AS base
+FROM node:22-alpine AS base
 RUN corepack enable && corepack prepare yarn@1.22.22 --activate
 WORKDIR /app
 

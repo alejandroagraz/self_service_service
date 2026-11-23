@@ -3,9 +3,10 @@
  * conoce TypeORM, Fastify ni infraestructura. Importa solo `fail` (error de dominio), permitido desde
  * `domain/` (ver `shared/errors/app-error.ts`).
  *
- * El estado NO se persiste: se DERIVA de la última marcación del empleado. Las transiciones válidas
- * son pocas y explícitas, de modo que una secuencia imposible (p. ej. CHECK_OUT sin jornada abierta)
- * se rechaza con un 409 antes de escribir.
+ * El estado NO se persiste: se DERIVA de la última marcación del periodo vigente, que acota
+ * `operational-day.ts` (ventana del turno o día natural, GAP-003). Las transiciones válidas son pocas
+ * y explícitas, de modo que una secuencia imposible (p. ej. CHECK_OUT sin jornada abierta) se rechaza
+ * con un 409 antes de escribir.
  */
 import { fail } from "../../../../shared/errors/app-error";
 
@@ -15,7 +16,10 @@ export type ClockAction = (typeof CLOCK_ACTIONS)[number];
 export const CLOCK_STATUSES = ["NOT_STARTED", "CLOCKED_IN", "ON_BREAK", "CLOCKED_OUT"] as const;
 export type ClockStatus = (typeof CLOCK_STATUSES)[number];
 
-/** Estado de jornada derivado de la ÚLTIMA marcación (o `null` si el empleado no tiene ninguna). */
+/**
+ * Estado de jornada derivado de la ÚLTIMA marcación del periodo vigente (o `null` si no hay ninguna
+ * en él). Quien acota el periodo es `resolveOperationalDay`; no se llama con la última histórica.
+ */
 export const statusFromLastPunch = (lastAction: ClockAction | null): ClockStatus => {
   switch (lastAction) {
     case null:

@@ -26,6 +26,7 @@ import {
   ClockPunchRequestDto,
   GreetCelebrationRequestDto,
 } from "../../../application/dtos/self-portal.dto";
+import { GetMyClockStatusUseCase } from "../../../application/use-cases/get-my-clock-status.use-case";
 import { GetMyMonthAbsencesUseCase } from "../../../application/use-cases/get-my-month-absences.use-case";
 import { GetMyProfileUseCase } from "../../../application/use-cases/get-my-profile.use-case";
 import { GetMyPunctualityUseCase } from "../../../application/use-cases/get-my-punctuality.use-case";
@@ -77,12 +78,19 @@ export class SelfPortalController {
     @inject(GreetCelebrationUseCase) private readonly greetCelebration: GreetCelebrationUseCase,
     @inject(UngreetCelebrationUseCase)
     private readonly ungreetCelebration: UngreetCelebrationUseCase,
+    @inject(GetMyClockStatusUseCase) private readonly getMyClockStatus: GetMyClockStatusUseCase,
   ) {}
 
   async profile(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
     const principal = principalOf(request);
     const data = await this.getMyProfile.execute(principal.tenantId, bearerOf(request));
     return reply.status(200).send(ok(data, "Perfil del colaborador obtenido con éxito."));
+  }
+
+  async clockStatus(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
+    const principal = principalOf(request);
+    const data = await this.getMyClockStatus.execute(principal.tenantId, bearerOf(request));
+    return reply.status(200).send(ok(data, "Estado de jornada."));
   }
 
   async payslips(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {

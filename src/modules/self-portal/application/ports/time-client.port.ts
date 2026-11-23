@@ -3,14 +3,25 @@
  * usuario). Hoy el dominio `time` lo sirve el proceso fusionado `people` bajo el prefijo
  * `/api/v1/time/internal`, validado contra la ÚNICA clave de lectura per-caller de `self-service`.
  *
- * - `getActiveShift`: turno activo del empleado hoy. SECUNDARIO: su caída NO rompe el perfil. El
- *   caso de uso degrada a `activeShiftName = "Sin turno asignado"` si time no responde (ver
- *   `get-my-profile.use-case.ts`).
+ * - `getActiveShift`: turno de hoy (`shiftName`), asignaciones de ayer, hoy y mañana y parámetros
+ *   de jornada del tenant (GAP-003). Es la entrada del «día operativo» (`operational-day.ts`):
+ *     · PRIMARIO de `GET /me/clock-status` y de `POST /me/clock-punch` (su caída → 503);
+ *     · SECUNDARIO de `GET /me/profile`, que degrada a "Sin turno asignado" y al día natural.
  * - `getPunctuality`: resumen de puntualidad mensual del empleado. PRIMARIO de `GET /me/punctuality`:
  *   su caída SÍ rompe ese endpoint (503), no se degrada.
  */
+import type {
+  AttendanceSettings,
+  ShiftAssignmentSlot,
+} from "../../domain/services/operational-day";
+
 export interface ActiveShiftDto {
+  /** Nombre del turno asignado HOY (día civil VET), o `null` si no tiene turno hoy. */
   readonly shiftName: string | null;
+  /** Asignaciones de ayer, hoy y mañana ordenadas por `startAt`; vacío con el contrato antiguo. */
+  readonly assignments: readonly ShiftAssignmentSlot[];
+  /** Parámetros efectivos del tenant; los de 01B por defecto con el contrato antiguo. */
+  readonly settings: AttendanceSettings;
 }
 
 /** Resumen de puntualidad mensual (contrato de `/api/v1/time/internal/punctuality`). */
@@ -30,6 +41,7 @@ export interface PunctualityDto {
 }
 
 export interface ITimeClient {
+  /** Lanza `SELF_UPSTREAM_UNAVAILABLE` (503) si time no responde o rompe el contrato. */
   getActiveShift(tenantId: string, employeeId: string): Promise<ActiveShiftDto>;
   /** `month` en formato `AAAA-MM` (obligatorio para el contrato interno de `time`). */
   getPunctuality(tenantId: string, employeeId: string, month: string): Promise<PunctualityDto>;

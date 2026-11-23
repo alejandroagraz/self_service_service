@@ -61,13 +61,22 @@ export const principalOf = (request: FastifyRequest): AuthenticatedPrincipal => 
 };
 
 /**
+ * Permiso que exige un preHandler creado por `requirePermission`, o `undefined` si no lo es. Lo usa
+ * el catálogo de rutas del OpenAPI (DEC-16) para verificar que el `x-permission` documentado coincide
+ * con el que la ruta aplica de verdad (`tests/contract/openapi-drift.test.ts`).
+ */
+const REQUIRED_PERMISSIONS = new WeakMap<object, string>();
+
+export const requiredPermissionOf = (preHandler: unknown): string | undefined =>
+  typeof preHandler === "function" ? REQUIRED_PERMISSIONS.get(preHandler) : undefined;
+
+/**
  * Exige un permiso del principal. Reutiliza `authenticate` si la ruta aún no lo invocó. Los
  * permisos son los que emite identity en el token (catálogo de `identity`); `time` solo los
  * comprueba, no los define.
  */
-export const requirePermission =
-  (permission: string) =>
-  async (request: FastifyRequest): Promise<void> => {
+export const requirePermission = (permission: string) => {
+  const preHandler = async (request: FastifyRequest): Promise<void> => {
     if (request.principal === undefined) {
       await authenticate(request);
     }
@@ -75,6 +84,9 @@ export const requirePermission =
       throw fail("FORBIDDEN", [{ field: "permission", issue: permission }]);
     }
   };
+  REQUIRED_PERMISSIONS.set(preHandler, permission);
+  return preHandler;
+};
 
 export const registerAuthentication = (app: FastifyInstance): void => {
   app.decorateRequest("principal", undefined);

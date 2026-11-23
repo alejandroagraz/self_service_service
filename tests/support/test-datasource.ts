@@ -10,7 +10,7 @@
  * No importa el `env` del servicio a propósito: estos tests no deben exigir el entorno HTTP/worker
  * completo. Los parámetros salen de las variables `TEST_*` que exporta `test-db.sh`.
  */
-import { DataSource } from "typeorm";
+import { DataSource, type DataSourceOptions } from "typeorm";
 
 const HOST = process.env.TEST_PG_HOST ?? "localhost";
 const PORT = Number(process.env.TEST_PG_PORT ?? "55443");
@@ -21,7 +21,9 @@ const MIGRATOR_USER = process.env.TEST_MIGRATOR_USER ?? "migrator_self_service";
 
 export const SCHEMA = "self_service";
 
-const makeDataSource = (username: string): DataSource =>
+type Entities = NonNullable<DataSourceOptions["entities"]>;
+
+const makeDataSource = (username: string, entities: Entities): DataSource =>
   new DataSource({
     type: "postgres",
     host: HOST,
@@ -30,13 +32,14 @@ const makeDataSource = (username: string): DataSource =>
     username,
     password: PASSWORD,
     schema: SCHEMA,
-    entities: [],
+    entities,
     synchronize: false,
     logging: false,
   });
 
-export const asApp = (): DataSource => makeDataSource(APP_USER);
-export const asMigrator = (): DataSource => makeDataSource(MIGRATOR_USER);
+/** `entities`: modelos para usar los repositorios TypeORM reales del servicio (opcional). */
+export const asApp = (entities: Entities = []): DataSource => makeDataSource(APP_USER, entities);
+export const asMigrator = (): DataSource => makeDataSource(MIGRATOR_USER, []);
 
 /** Función de consulta acotada a una transacción. Las filas se tipan con un `as` en cada test. */
 export type TxQuery = (sql: string, params?: readonly unknown[]) => Promise<unknown[]>;

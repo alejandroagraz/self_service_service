@@ -13,6 +13,12 @@
  * se invoca SIN `missing_ok`, así que sin contexto de tenant la consulta LANZA (fail-closed por
  * excepción, no por lista vacía). `outbox_events` es la única tabla del schema SIN RLS (el poller del
  * Outbox es global): se usa como contraste de "legible sin contexto".
+ *
+ * Ampliación GAP-003 (Lote 3.3): el «día operativo» lee las marcaciones por `employee_id` y rango de
+ * `punched_at`. Se verifica con el repositorio TypeORM REAL que, bajo el tenant A, esas lecturas no
+ * ven las marcaciones del tenant B aunque compartan `employee_id`, y que existe el índice
+ * `(tenant_id, employee_id, punched_at DESC)` que las sirve (01B GAP-003 §3: no hace falta la
+ * migración `1794700000020`).
  */
 import { randomUUID } from "node:crypto";
 import { after, before, test } from "node:test";
@@ -20,6 +26,8 @@ import assert from "node:assert/strict";
 
 import type { DataSource } from "typeorm";
 
+import { TypeOrmClockPunchRepository } from "../../src/modules/self-portal/infrastructure/repositories/typeorm-clock-punch.repository";
+import { ClockPunchModel } from "../../src/shared/infrastructure/database/models/clock-punch.model";
 import { asApp, asMigrator, inTenantTx } from "../support/test-datasource";
 
 let app: DataSource;
@@ -29,31 +37,41 @@ const tenantA = randomUUID();
 const tenantB = randomUUID();
 const idA = randomUUID();
 const idB = randomUUID();
+// Mismo `employee_id` en los dos tenants (colisión de UUID o dato mal migrado): RLS debe aislarlos.
+const sharedEmployee = randomUUID();
+const idSharedA = randomUUID();
+const idSharedB = randomUUID();
 
 before(async () => {
-  app = asApp();
+  app = asApp([ClockPunchModel]);
   migrator = asMigrator();
   await app.initialize();
   await migrator.initialize();
 
-  // Semilla cross-tenant como dueño del schema (exención-de-propietario): una fila por tenant.
-  // Se cubren todas las columnas NOT NULL sin default (id, tenant_id, employee_id, user_id, action,
-  // punched_at) y se respeta el CHECK de `action` (CHECK_IN | BREAK | CHECK_OUT).
-  for (const [id, tenant] of [
-    [idA, tenantA],
-    [idB, tenantB],
-  ] as const) {
+  // Semilla cross-tenant como dueño del schema (exención-de-propietario). Se cubren todas las
+  // columnas NOT NULL sin default (id, tenant_id, employee_id, user_id, action, punched_at) y se
+  // respeta el CHECK de `action` (CHECK_IN | BREAK | CHECK_OUT). La de B es POSTERIOR a la de A
+  // para el empleado compartido: si se filtrara, sería la «última marcación».
+  const rows: readonly (readonly [string, string, string, string, string])[] = [
+    [idA, tenantA, randomUUID(), "CHECK_IN", "2027-03-01T08:00:00Z"],
+    [idB, tenantB, randomUUID(), "CHECK_IN", "2027-03-01T08:00:00Z"],
+    [idSharedA, tenantA, sharedEmployee, "CHECK_IN", "2027-03-01T12:00:00Z"],
+    [idSharedB, tenantB, sharedEmployee, "CHECK_OUT", "2027-03-01T13:00:00Z"],
+  ];
+  for (const [id, tenant, employee, action, punchedAt] of rows) {
     await migrator.query(
       `INSERT INTO self_service.clock_punches
          (id, tenant_id, employee_id, user_id, action, punched_at)
-       VALUES ($1, $2, $3, $4, 'CHECK_IN', $5)`,
-      [id, tenant, randomUUID(), randomUUID(), "2027-03-01T08:00:00Z"],
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, tenant, employee, randomUUID(), action, punchedAt],
     );
   }
 });
 
 after(async () => {
-  await migrator.query(`DELETE FROM self_service.clock_punches WHERE id = ANY($1)`, [[idA, idB]]);
+  await migrator.query(`DELETE FROM self_service.clock_punches WHERE id = ANY($1)`, [
+    [idA, idB, idSharedA, idSharedB],
+  ]);
   await app.destroy();
   await migrator.destroy();
 });
@@ -63,7 +81,7 @@ test("bajo withTenant(A), app_self_service SOLO ve filas del tenant A", async ()
     const total = (await q(`SELECT count(*)::int AS n FROM self_service.clock_punches`)) as {
       n: number;
     }[];
-    assert.equal(total[0].n, 1, "solo debe ver una fila (la de A)");
+    assert.equal(total[0].n, 2, "solo debe ver las dos filas de A");
     const foreign = (await q(
       `SELECT count(*)::int AS n FROM self_service.clock_punches WHERE id = $1`,
       [idB],
@@ -106,4 +124,41 @@ test("la tabla SIN RLS (outbox_events, exención documentada) es legible sin con
     }[];
     assert.ok(r[0].n >= 0, "el Outbox no lleva RLS: el poller global lo lee sin GUC de tenant");
   });
+});
+
+test("GAP-003: las lecturas del día operativo bajo A no ven las marcaciones de B con el mismo employee_id", async () => {
+  const runner = app.createQueryRunner();
+  await runner.connect();
+  await runner.startTransaction();
+  try {
+    // Igual que `TypeOrmUnitOfWork.withTenant`: GUC local a la transacción y repositorio REAL.
+    await runner.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantA]);
+    const repo = new TypeOrmClockPunchRepository(runner.manager);
+    const inRange = await repo.findPunchesInRange(
+      sharedEmployee,
+      new Date("2027-03-01T00:00:00Z"),
+      new Date("2027-03-02T00:00:00Z"),
+    );
+    assert.deepEqual(
+      inRange.map((punch) => punch.id),
+      [idSharedA],
+      "el rango del periodo vigente solo debe traer la marcación de A",
+    );
+    const last = await repo.findLastByEmployee(sharedEmployee);
+    assert.equal(last?.id, idSharedA, "la última marcación no puede ser la de B (posterior)");
+    assert.equal(last?.action, "CHECK_IN");
+  } finally {
+    await runner.rollbackTransaction();
+    await runner.release();
+  }
+});
+
+test("GAP-003: existe el índice (tenant_id, employee_id, punched_at DESC) sobre clock_punches", async () => {
+  const rows = (await migrator.query(
+    `SELECT indexdef FROM pg_indexes
+      WHERE schemaname = 'self_service' AND tablename = 'clock_punches'
+        AND indexname = 'ix_clock_punches_tenant_employee_punched'`,
+  )) as { indexdef: string }[];
+  assert.equal(rows.length, 1, "falta el índice ix_clock_punches_tenant_employee_punched");
+  assert.match(rows[0].indexdef, /\(tenant_id, employee_id, punched_at DESC\)/);
 });

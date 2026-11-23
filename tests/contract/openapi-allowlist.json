@@ -1,0 +1,10 @@
+{
+  "$comment": "DEC-16 = A (01B GAP-026 §7). Modo transitorio (Lotes 3.3 a 4.5): rutas nuevas o modificadas que DEBEN declarar su schema (operationId, tags, x-permission). La lista solo puede crecer. El Lote 6.1 pasa 'mode' a 'strict' y entonces se exige a todas las rutas registradas.",
+  "mode": "transitional",
+  "routes": [
+    "GET /api/v1/self-service/me/profile",
+    "GET /api/v1/self-service/me/clock-status",
+    "POST /api/v1/self-service/me/clock-punch",
+    "GET /api/v1/self-service/docs/openapi.json"
+  ]
+}

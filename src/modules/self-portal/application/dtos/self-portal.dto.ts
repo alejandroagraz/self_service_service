@@ -1,10 +1,33 @@
-import { IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength } from "class-validator";
+import {
+  IsBoolean,
+  IsIn,
+  IsInt,
+  IsNumber,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  MaxLength,
+} from "class-validator";
 
+import { Doc } from "../../../../shared/application/dto-docs";
 import {
   CLOCK_ACTIONS,
+  CLOCK_STATUSES,
   type ClockAction,
   type ClockStatus,
 } from "../../domain/services/clock-status";
+
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const HH_MM_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+const CLOCK_STATUS_VALUES = CLOCK_STATUSES as unknown as string[];
+
+/*
+ * Clases de RESPUESTA (DEC-16 = A): existen solo para que el OpenAPI se GENERE del mismo tipo que
+ * devuelven los casos de uso (`validationMetadatasToSchemas`). Sus decoradores de class-validator
+ * son documentación: estas clases nunca se instancian ni se validan (los casos de uso devuelven
+ * literales con su forma). Las de PETICIÓN (`ClockPunchRequestDto`…) sí se validan con `validateDto`.
+ */
 
 /**
  * Cuerpo de `POST /me/clock-punch`. `whitelist`/`forbidNonWhitelisted` (ver `validate-dto.ts`)
@@ -25,32 +48,157 @@ export class ClockPunchRequestDto {
 }
 
 /** Vista agregada de autoservicio del empleado (`GET /me/profile`). */
-export interface EmployeeSelfProfileDto {
-  readonly employeeId: string;
-  readonly userId: string;
-  readonly fullName: string;
-  readonly nationalId: string;
-  readonly email: string;
+export class EmployeeSelfProfileDto {
+  @IsUUID()
+  readonly employeeId!: string;
+
+  @IsUUID()
+  readonly userId!: string;
+
+  @IsString()
+  readonly fullName!: string;
+
+  @IsString()
+  readonly nationalId!: string;
+
+  @IsString()
+  readonly email!: string;
+
   /** Siempre string: un teléfono ausente se coalesce a "". */
-  readonly phone: string;
-  readonly positionTitle: string;
-  readonly departmentName: string;
-  readonly supervisorName: string | null;
-  readonly site: string;
-  readonly hireDate: string;
-  readonly seniorityYears: number;
-  readonly vacationDaysAvailable: number;
-  readonly activeShiftName: string;
-  readonly currentClockStatus: ClockStatus;
-  readonly lastClockInAt: string | null;
+  @IsString()
+  readonly phone!: string;
+
+  @IsString()
+  readonly positionTitle!: string;
+
+  @IsString()
+  readonly departmentName!: string;
+
+  @IsString()
+  @Doc({ nullable: true })
+  readonly supervisorName!: string | null;
+
+  @IsString()
+  readonly site!: string;
+
+  @Matches(DATE_PATTERN)
+  readonly hireDate!: string;
+
+  @IsInt()
+  readonly seniorityYears!: number;
+
+  @IsNumber()
+  readonly vacationDaysAvailable!: number;
+
+  @IsString()
+  @Doc({ description: 'Nombre del turno asignado HOY (día civil VET), o "Sin turno asignado".' })
+  readonly activeShiftName!: string;
+
+  @IsIn(CLOCK_STATUS_VALUES)
+  @Doc({
+    description:
+      "Estado de jornada del día operativo vigente (misma función que GET /me/clock-status).",
+  })
+  readonly currentClockStatus!: ClockStatus;
+
+  @IsString()
+  @Doc({ format: "date-time", nullable: true })
+  readonly lastClockInAt!: string | null;
 }
 
 /** Respuesta de `POST /me/clock-punch`. */
-export interface ClockPunchResultDto {
-  readonly id: string;
-  readonly status: ClockStatus;
-  readonly timestamp: string;
-  readonly message: string;
+export class ClockPunchResultDto {
+  @IsUUID()
+  readonly id!: string;
+
+  @IsIn(CLOCK_STATUS_VALUES)
+  readonly status!: ClockStatus;
+
+  @IsString()
+  @Doc({ format: "date-time" })
+  readonly timestamp!: string;
+
+  @IsString()
+  readonly message!: string;
+}
+
+/** Turno de la asignación vigente en `GET /me/clock-status`. */
+export class ClockStatusShiftDto {
+  @IsString()
+  readonly name!: string;
+
+  @Matches(HH_MM_PATTERN)
+  readonly startTime!: string;
+
+  @Matches(HH_MM_PATTERN)
+  readonly endTime!: string;
+
+  @IsInt()
+  readonly breakMinutes!: number;
+
+  @IsBoolean()
+  readonly isNightShift!: boolean;
+}
+
+/** Ventana del turno vigente (instantes UTC) en `GET /me/clock-status`. */
+export class ClockStatusWindowDto {
+  @IsString()
+  @Doc({ format: "date-time", description: "Inicio del turno menos la ventana previa." })
+  readonly opensAt!: string;
+
+  @IsString()
+  @Doc({ format: "date-time" })
+  readonly shiftEndAt!: string;
+
+  @IsString()
+  @Doc({
+    format: "date-time",
+    description: "Fin del turno más el umbral de abandono, o la apertura del turno siguiente.",
+  })
+  readonly abandonAt!: string;
+}
+
+/** Estado de jornada real del empleado (`GET /me/clock-status`, GAP-003). */
+export class ClockStatusDto {
+  @IsIn(CLOCK_STATUS_VALUES)
+  readonly status!: ClockStatus;
+
+  @Matches(DATE_PATTERN)
+  @Doc({ description: "Día de trabajo de la asignación vigente, o la fecha civil VET sin turno." })
+  readonly operationalDate!: string;
+
+  @IsString()
+  @Doc({
+    format: "date-time",
+    nullable: true,
+    description: "Marcación que fija el estado actual dentro del periodo vigente.",
+  })
+  readonly since!: string | null;
+
+  @IsString()
+  @Doc({
+    format: "date-time",
+    nullable: true,
+    description: "Última marcación del empleado, de cualquier periodo.",
+  })
+  readonly lastPunchAt!: string | null;
+
+  @Doc({ nested: () => ClockStatusShiftDto, nullable: true })
+  readonly shift!: ClockStatusShiftDto | null;
+
+  @Doc({
+    nested: () => ClockStatusWindowDto,
+    nullable: true,
+    description:
+      "null solo si hoy no hay turno asignado (día natural VET). Fuera de ventana un día con turno es la ventana de la siguiente asignación o la de la última de hoy ya vencida.",
+  })
+  readonly window!: ClockStatusWindowDto | null;
+
+  @IsInt()
+  readonly lateArrivalGraceMinutes!: number;
+
+  @IsInt()
+  readonly earlyDepartureGraceMinutes!: number;
 }
 
 /** Tipo de celebración expuesto por el BFF (`GET /me/celebrations`). */

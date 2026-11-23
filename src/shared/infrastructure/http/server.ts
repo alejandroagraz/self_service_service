@@ -8,6 +8,16 @@
  * Por eso NO registra ningún preHandler de "servicio de confianza" entrante; en su lugar, al construir
  * el servidor lee las claves per-pair SALIENTES (`http-secrets.ts`) y registra los clientes hacia
  * people/payroll/absences/time (`registerOutboundClients`).
+ *
+ * `buildHttpServer` (producción) = secretos + clientes del contenedor + `buildHttpApp`. Los tests de
+ * `tests/http` y `tests/contract` llaman a `buildHttpApp` directamente, con dobles ya registrados en
+ * el contenedor y el limitador en memoria: así ejercitan EXACTAMENTE el mismo ensamblado de rutas,
+ * hooks y manejadores de error que producción.
+ *
+ * OpenAPI (DEC-16 = A): los `schema` de ruta son SOLO documentación. El validador de Fastify queda
+ * desactivado (`setValidatorCompiler`: class-validator sigue siendo el único validador y el 422 con
+ * `code` no cambia por un 400 de ajv) y el serializador por esquema también (`setSerializerCompiler`:
+ * `JSON.stringify` tal cual, sin recortar campos con fast-json-stringify).
  */
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
@@ -22,6 +32,7 @@ import { childLogger } from "../../logger/logger";
 import { contextLogger } from "../services/winston-logger";
 import { registerSelfPortalRoutes } from "../../../modules/self-portal/infrastructure/http/routes/self-portal.routes";
 import { registerAuthentication } from "./middlewares/authentication.middleware";
+import { registerOpenapi, registerOpenapiDocumentRoute } from "./openapi/openapi";
 import { frameworkErrorHandler, registerErrorHandler } from "./error-handler";
 import { HttpMetrics, METRICS_ROUTE } from "./metrics";
 import { rateLimitErrorResponse } from "./middlewares/rate-limit/ip-rate-limit";
@@ -49,6 +60,24 @@ export const buildHttpServer = async (redis: Redis): Promise<FastifyInstance> =>
   // per-pair, cada uno con SU clave dedicada). El rol worker no los registra (no sirve HTTP).
   registerOutboundClients(secrets);
 
+  return buildHttpApp({
+    rateLimitStore: createRateLimitStore(
+      redis,
+      contextLogger("rate-limit"),
+    ) as unknown as RateLimitPluginOptions["store"],
+  });
+};
+
+export interface HttpAppOptions {
+  /** Store del limitador global. Sin él, el plugin cuenta en la memoria del proceso (tests). */
+  readonly rateLimitStore?: RateLimitPluginOptions["store"];
+}
+
+/**
+ * Ensamblado de Fastify sin efectos de arranque: no lee secretos ni registra clientes en el
+ * contenedor (lo hace `buildHttpServer`). Exige que el contenedor ya tenga los clientes.
+ */
+export const buildHttpApp = async (options: HttpAppOptions = {}): Promise<FastifyInstance> => {
   const metrics = new HttpMetrics();
 
   const app = Fastify({
@@ -65,6 +94,10 @@ export const buildHttpServer = async (redis: Redis): Promise<FastifyInstance> =>
       metrics.observeFrameworkError(request, reply);
     },
   });
+
+  // Esquemas de ruta = documentación (DEC-16 = A): ni validan ni recortan la respuesta (ver cabecera).
+  app.setValidatorCompiler(() => () => true);
+  app.setSerializerCompiler(() => JSON.stringify);
 
   await app.register(helmet, { contentSecurityPolicy: false });
 
@@ -84,10 +117,7 @@ export const buildHttpServer = async (redis: Redis): Promise<FastifyInstance> =>
     global: true,
     max: env.GLOBAL_RATE_LIMIT_MAX,
     timeWindow: env.GLOBAL_RATE_LIMIT_WINDOW_MS,
-    store: createRateLimitStore(
-      redis,
-      contextLogger("rate-limit"),
-    ) as unknown as RateLimitPluginOptions["store"],
+    ...(options.rateLimitStore === undefined ? {} : { store: options.rateLimitStore }),
     keyGenerator: ipRateLimitKey,
     skipOnError: true,
     errorResponseBuilder: rateLimitErrorResponse,
@@ -95,6 +125,8 @@ export const buildHttpServer = async (redis: Redis): Promise<FastifyInstance> =>
 
   registerAuthentication(app);
   registerErrorHandler(app);
+  // Antes de cualquier ruta: `@fastify/swagger` y el catálogo de rutas escuchan `onRoute`.
+  const openapi = await registerOpenapi(app);
 
   // `/health` y `/metrics` quedan FUERA del limitador (`rateLimit: false`). `/metrics` no se expone
   // por Traefik ni lleva autenticación: solo publica recuentos, sin tenants, usuarios ni IPs.
@@ -112,6 +144,7 @@ export const buildHttpServer = async (redis: Redis): Promise<FastifyInstance> =>
   await app.register(
     async (scope) => {
       registerSelfPortalRoutes(scope);
+      registerOpenapiDocumentRoute(scope, openapi);
     },
     { prefix: API_PREFIX },
   );

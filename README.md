@@ -13,8 +13,11 @@ de una tabla propia: `clock_punches` (fichaje, POR-TENANT con RLS, append-only).
 | Método | Ruta | Permiso | Fuentes |
 |---|---|---|---|
 | GET | `/api/v1/self-service/me/profile` | `self_service:read` | people + absences + time + clock_punches |
+| GET | `/api/v1/self-service/me/clock-status` | `self_service:read` | people + time + clock_punches |
 | GET | `/api/v1/self-service/me/payslips` | `self_service:read` | people + payroll |
-| POST | `/api/v1/self-service/me/clock-punch` | `self_service:punch` | people + clock_punches + Outbox |
+| POST | `/api/v1/self-service/me/clock-punch` | `self_service:punch` | people + time + clock_punches + Outbox |
+
+OpenAPI publicado (red interna, excluido de Traefik): `GET /api/v1/self-service/docs/openapi.json`.
 
 ## Auth saliente
 - **people**: pass-through del token del usuario (`GET /employees/me`).
@@ -23,8 +26,9 @@ de una tabla propia: `clock_punches` (fichaje, POR-TENANT con RLS, append-only).
 
 ## Fichaje
 Acciones `CHECK_IN | BREAK | CHECK_OUT`; el estado (`NOT_STARTED`/`CLOCKED_IN`/`ON_BREAK`/`CLOCKED_OUT`)
-se deriva de la última marcación. Cada fichaje emite `attendance.punched` por Transactional Outbox en
-el mismo commit. Transición inválida → `409`.
+se deriva de las marcaciones del día operativo vigente (ventana del turno o día natural VET, GAP-003).
+Cada fichaje emite `attendance.punched` por Transactional Outbox en el mismo commit. Transición
+inválida → `409 SSVCLK0002`; entrada fuera de la ventana un día con turno → `409 SSVCLK0003`.
 
 ## Roles de proceso
 `ROLE=api` (HTTP), `ROLE=worker` (poller del Outbox, publish-only) o `ROLE=all`.
@@ -34,5 +38,7 @@ el mismo commit. Transición inválida → `409`.
 yarn install
 yarn build      # tsc
 yarn lint       # eslint
+yarn test:nodb  # unit + http + contract (sin BD)
+yarn test       # todo, incluido RLS: ../fibex-infra/scripts/test-db.sh self_service
 yarn migration:run
 ```
