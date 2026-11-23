@@ -48,6 +48,7 @@
     "prettier": "^3.3.0",
     "ts-node": "^10.9.2",
     "tsx": "^4.19.0",
+    "typeorm-extension": "^3",
     "typescript": "^5.6.0"
   }
 }

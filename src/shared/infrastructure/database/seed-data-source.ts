@@ -10,13 +10,15 @@
  * del servicio HTTP. La contraseña del migrator llega como **Docker secret**
  * (`POSTGRES_MIGRATOR_PASSWORD_FILE`), nunca como variable (rulebook §9.2).
  */
-import { DataSource } from "typeorm";
+import { DataSource, type DataSourceOptions } from "typeorm";
+import type { SeederOptions } from "typeorm-extension";
 import { cleanEnv, port, str } from "envalid";
 
 import { withEmptyAsUnset } from "../../config/empty-as-unset";
 import { assertSecretsNotInEnvironment, readSecretFile } from "../../config/secret-file";
 import { SELF_SERVICE_MODELS } from "./models";
 import { SELF_SERVICE_SCHEMA } from "./schema";
+import { InitSeeder } from "./seeding/init.seeder";
 
 const seedEnv = cleanEnv(withEmptyAsUnset(process.env), {
   POSTGRES_HOST: str(),
@@ -33,7 +35,10 @@ const migratorPassword = readSecretFile(
   seedEnv.POSTGRES_MIGRATOR_PASSWORD_FILE,
 );
 
-export const seedDataSource = new DataSource({
+// `seeds` (typeorm-extension) registra el orquestador `InitSeeder`; `runSeeders(seedDataSource)`
+// lo lee de aquí. `seedTracking` queda en su default (false): no se crea tabla de tracking, la
+// idempotencia la garantizan los sub-seeders (upsert por clave natural).
+const seedOptions: DataSourceOptions & SeederOptions = {
   type: "postgres",
   host: seedEnv.POSTGRES_HOST,
   port: seedEnv.POSTGRES_PORT,
@@ -45,4 +50,7 @@ export const seedDataSource = new DataSource({
   synchronize: false,
   migrationsRun: false,
   logging: ["error", "warn"],
-});
+  seeds: [InitSeeder],
+};
+
+export const seedDataSource = new DataSource(seedOptions);

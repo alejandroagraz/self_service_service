@@ -1,3 +1,10 @@
+// ⚠ FUENTE CANÓNICA — editar SOLO este archivo. Las copias en cada servicio son GENERADAS.
+// Sincronizar con:  node fibex-infra/scripts/sync-seed-fixtures.mjs
+// Verificar (CI / seed-all):  node fibex-infra/scripts/sync-seed-fixtures.mjs --check
+// Destino: <servicio NO-identity>/src/shared/infrastructure/database/seeding/fixtures.ts
+// Versión RECORTADA (sin ALL_PERMISSIONS/ROLE_DEFS/resolveTenantUsers): los servicios de snapshot
+// solo necesitan el catálogo de tenants y SEED_USER_DEFS. RAW_TENANTS debe coincidir con fixtures.ts
+// (lo verifica `--check`). La versión superset de identity vive en fixtures.ts.
 /**
  * Fixtures CANÓNICAS y DETERMINÍSTICAS del seeding multi-tenant de Fibex RRHH.
  *

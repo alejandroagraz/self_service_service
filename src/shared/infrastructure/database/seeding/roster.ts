@@ -1,3 +1,8 @@
+// ⚠ FUENTE CANÓNICA — editar SOLO este archivo. Las copias en cada servicio son GENERADAS.
+// Sincronizar con:  node fibex-infra/scripts/sync-seed-fixtures.mjs
+// Verificar (CI / seed-all):  node fibex-infra/scripts/sync-seed-fixtures.mjs --check
+// Destino: <servicio NO-identity>/src/shared/infrastructure/database/seeding/roster.ts
+// Importa de `./fixtures` (la copia recortada generada desde fixtures.shared.ts, en el mismo dir).
 /**
  * ROSTER CANÓNICO Y DETERMINÍSTICO de cada tenant (empleados + departamentos + cargos).
  *
