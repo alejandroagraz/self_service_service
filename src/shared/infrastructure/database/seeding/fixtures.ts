@@ -49,6 +49,13 @@ const RAW_TENANTS: ReadonlyArray<Omit<SeedTenant, "id">> = [
     adminEmail: "admin@fibex-aragua.test",
     adminPassword: "Admin.Aragua2026!",
   },
+  {
+    slug: "demo-rrhh",
+    name: "Demo RRHH, C.A.",
+    taxId: "J-500789012",
+    adminEmail: "admin@demo-rrhh.test",
+    adminPassword: "Admin.Demo2026!",
+  },
 ];
 
 /** Catálogo determinístico de tenants (empresas demo). `id = deterministicUuid("tenant:<slug>")`. */
@@ -73,4 +80,7 @@ export const SEED_USER_DEFS: ReadonlyArray<SeedUserDef> = [
   { key: "auditoria", roleName: "internal-auditor", localpart: "auditoria", fullName: "Auditor Interno", password: "Audit.Fibex2026!" },
   { key: "supervisor", roleName: "supervisor", localpart: "supervisor", fullName: "Supervisor de Área", password: "Super.Fibex2026!" },
   { key: "colaborador", roleName: "employee", localpart: "colaborador", fullName: "Colaborador Fibex", password: "Colab.Fibex2026!" },
+  // Colaborador DEDICADO a 2FA (demo QA): se le siembra TOTP ACTIVE, por lo que su login exige
+  // password + código TOTP. No afecta a los 6 anteriores (que siguen con login por password).
+  { key: "colaborador-2fa", roleName: "employee", localpart: "colaborador.2fa", fullName: "Colaborador 2FA (demo)", password: "Colab2FA.Fibex2026!" },
 ];

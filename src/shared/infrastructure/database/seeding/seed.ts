@@ -7,12 +7,14 @@ import "reflect-metadata";
 
 import { seedDataSource } from "../seed-data-source";
 import { InitSeeder } from "./init.seeder";
+import { resetTenantsIfRequested } from "./reset";
 
 async function main(): Promise<void> {
   await seedDataSource.initialize();
   try {
     // eslint-disable-next-line no-console
     console.log("🌱 self_service: iniciando seeding multi-tenant…");
+    await resetTenantsIfRequested(seedDataSource);
     await new InitSeeder().run(seedDataSource);
     // eslint-disable-next-line no-console
     console.log("✅ self_service: seeding completado");
