@@ -5,7 +5,8 @@
  *   authorization: Bearer <token del usuario>   (PASS-THROUGH; people resuelve su propia ficha)
  *   x-service-name: self-service
  *
- * Desenvuelve el envelope `ResponseDto` (`{ data }`). Mapeo de error (como identity-client, §10.4):
+ * Desenvuelve el envelope `ResponseDto` (`{ data }`). `serviceYears` (GAP-033 §6) es opcional en el
+ * parseo: si falta o no es un entero >= 0, el perfil sigue y el campo queda `null`. Mapeo de error (como identity-client, §10.4):
  *   401 → UNAUTHORIZED, 403 → FORBIDDEN, 404 (EMPLOYEE_NOT_LINKED) → SELF_PROFILE_NOT_LINKED,
  *   5xx/red/timeout → SELF_UPSTREAM_UNAVAILABLE.
  *
@@ -35,6 +36,10 @@ const PROFILE_PATH = "/api/v1/people/employees/me";
 const nullableString = (value: unknown): string | null =>
   typeof value === "string" ? value : null;
 
+/** Entero >= 0, o `null` (ausente o de otro tipo): el BFF no inventa años de servicio. */
+const nonNegativeIntOrNull = (value: unknown): number | null =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+
 const parseProfile = (data: unknown): MyProfileDto | null => {
   if (typeof data !== "object" || data === null) {
     return null;
@@ -61,6 +66,7 @@ const parseProfile = (data: unknown): MyProfileDto | null => {
     supervisorName: nullableString(d.supervisorName),
     site: asString(d.site) ?? "",
     hireDate,
+    serviceYears: nonNegativeIntOrNull(d.serviceYears),
   };
 };
 

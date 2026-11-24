@@ -10,12 +10,12 @@ import type { ActiveShiftDto, ITimeClient } from "../ports/time-client.port";
 import type { EmployeeSelfProfileDto } from "../dtos/self-portal.dto";
 import { loadOperationalDay, UNKNOWN_ACTIVE_SHIFT } from "./operational-day-state";
 
-const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000;
 const NO_SHIFT = "Sin turno asignado";
 
 /**
  * Compone la vista de autoservicio `GET /me/profile` a partir de cuatro fuentes:
- *   - people (PRIMARIO, pass-through del token): resuelve la ficha del empleado por su `userId`.
+ *   - people (PRIMARIO, pass-through del token): resuelve la ficha del empleado por su `userId`,
+ *     incluidos los años de servicio (`serviceYears` → `seniorityYears`, GAP-033 §6).
  *   - absences (SECUNDARIO, confianza per-pair): días de vacaciones disponibles.
  *   - time (SECUNDARIO, confianza per-pair): nombre del turno de hoy y asignaciones/parámetros del
  *     día operativo.
@@ -73,24 +73,13 @@ export class GetMyProfileUseCase {
       supervisorName: profile.supervisorName,
       site: profile.site,
       hireDate: profile.hireDate,
-      seniorityYears: this.seniorityYears(profile.hireDate),
+      // GAP-033 §6: fuente única en people (`serviceYears`). Sin él, `null`; nunca se recalcula aquí.
+      seniorityYears: profile.serviceYears,
       vacationDaysAvailable,
       activeShiftName: shift.shiftName ?? NO_SHIFT,
       currentClockStatus,
       lastClockInAt,
     };
-  }
-
-  /** Años completos de antigüedad desde `hireDate` (YYYY-MM-DD) hasta hoy; nunca negativo. */
-  private seniorityYears(hireDate: string): number {
-    const parts = hireDate.split("-").map(Number);
-    if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) {
-      return 0;
-    }
-    const [year, month, day] = parts;
-    const hireMs = Date.UTC(year, month - 1, day);
-    const years = Math.floor((this.clock.now().getTime() - hireMs) / MS_PER_YEAR);
-    return years > 0 ? years : 0;
   }
 
   /** Días disponibles; 0 (degradado) si absences no responde. */

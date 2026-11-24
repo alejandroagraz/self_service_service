@@ -25,7 +25,9 @@ import { validateDto } from "../../../../../shared/infrastructure/http/validate-
 import {
   ClockPunchRequestDto,
   GreetCelebrationRequestDto,
+  PayslipContentParamsDto,
 } from "../../../application/dtos/self-portal.dto";
+import { DownloadMyPayslipContentUseCase } from "../../../application/use-cases/download-my-payslip-content.use-case";
 import { GetMyClockStatusUseCase } from "../../../application/use-cases/get-my-clock-status.use-case";
 import { GetMyMonthAbsencesUseCase } from "../../../application/use-cases/get-my-month-absences.use-case";
 import { GetMyProfileUseCase } from "../../../application/use-cases/get-my-profile.use-case";
@@ -79,6 +81,8 @@ export class SelfPortalController {
     @inject(UngreetCelebrationUseCase)
     private readonly ungreetCelebration: UngreetCelebrationUseCase,
     @inject(GetMyClockStatusUseCase) private readonly getMyClockStatus: GetMyClockStatusUseCase,
+    @inject(DownloadMyPayslipContentUseCase)
+    private readonly downloadMyPayslipContent: DownloadMyPayslipContentUseCase,
   ) {}
 
   async profile(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
@@ -99,6 +103,29 @@ export class SelfPortalController {
     return reply
       .status(200)
       .send(ok(data, "Recibos de pago obtenidos con éxito.", { total: data.length }));
+  }
+
+  /**
+   * PDF de un recibo propio (GAP-012): binario en stream, SIN envelope. El nombre ya viene saneado a
+   * ASCII (`recibo-<periodo>.pdf`). `no-store`: es un documento con datos personales y salariales.
+   */
+  async payslipContent(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
+    const principal = principalOf(request);
+    const { payslipId } = validateDto(PayslipContentParamsDto, request.params);
+    const content = await this.downloadMyPayslipContent.execute(
+      principal.tenantId,
+      bearerOf(request),
+      payslipId,
+    );
+    reply
+      .status(200)
+      .header("content-type", "application/pdf")
+      .header("content-disposition", `attachment; filename="${content.filename}"`)
+      .header("cache-control", "private, no-store");
+    if (content.contentLength !== null) {
+      reply.header("content-length", String(content.contentLength));
+    }
+    return reply.send(content.stream);
   }
 
   async punch(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {

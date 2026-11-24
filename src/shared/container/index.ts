@@ -15,6 +15,7 @@ import { appDataSource } from "../infrastructure/database/data-source";
 import { TypeOrmUnitOfWork } from "../infrastructure/database/typeorm-unit-of-work";
 import { createRedisClient } from "../infrastructure/cache/redis-client";
 import { AbsencesClient } from "../infrastructure/http/absences-client";
+import { DocumentsClient } from "../infrastructure/http/documents-client";
 import { IdentityClient } from "../infrastructure/http/identity-client";
 import { PayrollClient } from "../infrastructure/http/payroll-client";
 import { PeopleClient } from "../infrastructure/http/people-client";
@@ -63,8 +64,9 @@ export const registerIdentityClient = (
  * Registra los clientes SALIENTES hacia los hermanos. Lo llama `buildHttpServer` tras leer las claves
  * per-pair (`http-secrets.ts`); el rol worker no lo llama (no sirve HTTP ni compone vistas).
  *
- * `people` (pass-through) reenvía el token del usuario (sin clave); `payroll`/`absences`/`time` son de
- * confianza per-pair, cada uno con SU clave dedicada. Todos comparten el timeout de upstream.
+ * `people` (pass-through) reenvía el token del usuario (sin clave); `payroll`/`absences`/`time`/
+ * `documents` son de confianza per-pair, cada uno con SU clave dedicada. Todos comparten el timeout de
+ * upstream (en `documents`, hasta recibir las cabeceras: el cuerpo fluye en stream).
  *
  * `PeopleInternalClient` es el canal trusted-service hacia people (`/api/v1/people/internal/*`:
  * celebraciones y estado del equipo). El proceso fusionado `people` sirve los tres dominios
@@ -94,6 +96,14 @@ export const registerOutboundClients = (secrets: HttpSecrets): void => {
   container.registerInstance(
     TOKENS.TimeClient,
     new TimeClient(env.TIME_INTERNAL_URL, secrets.timeReadKey, env.UPSTREAM_TIMEOUT_MS),
+  );
+  container.registerInstance(
+    TOKENS.DocumentsClient,
+    new DocumentsClient(
+      env.DOCUMENTS_INTERNAL_URL,
+      secrets.documentsReadKey,
+      env.UPSTREAM_TIMEOUT_MS,
+    ),
   );
 };
 

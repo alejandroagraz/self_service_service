@@ -3,13 +3,14 @@
  * Expuestas por Traefik y de cara al usuario autenticado. Cada una exige token válido (`authenticate`)
  * y el permiso correspondiente del catálogo de identity:
  *   - lecturas del propio empleado (`/me/profile`, `/me/clock-status`, `/me/payslips`,
- *     `/me/celebrations`, `/me/punctuality`): `self_service:read`.
+ *     `/me/payslips/:payslipId/content`, `/me/celebrations`, `/me/punctuality`): `self_service:read`.
  *   - lectura de manager (`/me/team-status`): `team:read` (si falta, el preHandler responde 403).
  *   - escritura (`/me/clock-punch`): `self_service:punch`.
  *
  * La ruta solo declara método, path, hooks y su `schema` de documentación, y delega en el controller
  * resuelto del contenedor. DEC-16 = A (modo transitorio): las rutas nuevas o modificadas desde el Lote
- * 3.3 (`/me/profile`, `/me/clock-status`, `/me/clock-punch`) declaran `schema` (`routeSchema`); el
+ * 3.3 (`/me/profile`, `/me/clock-status`, `/me/clock-punch`, y desde el 4.2
+ * `/me/payslips/:payslipId/content`) declaran `schema` (`routeSchema`); el
  * resto lo completa el Lote 6.1. El `schema` NO valida: class-validator sigue siendo el validador.
  */
 import type { FastifyInstance } from "fastify";
@@ -28,6 +29,7 @@ import {
   ClockPunchResultDto,
   ClockStatusDto,
   EmployeeSelfProfileDto,
+  PayslipContentParamsDto,
 } from "../../../application/dtos/self-portal.dto";
 import { SelfPortalController } from "../controllers/self-portal.controller";
 
@@ -86,6 +88,39 @@ export const registerSelfPortalRoutes = (app: FastifyInstance): void => {
     "/me/payslips",
     { preHandler: [authenticate, requirePermission("self_service:read")] },
     (request, reply) => controller.payslips(request, reply),
+  );
+
+  app.get(
+    "/me/payslips/:payslipId/content",
+    {
+      preHandler: [authenticate, requirePermission(READ_PERMISSION)],
+      schema: routeSchema({
+        operationId: "downloadMyPayslipContent",
+        summary: "Descarga el PDF de un recibo de pago del empleado autenticado (GAP-012).",
+        description:
+          'Binario application/pdf en stream, sin envelope, con Content-Disposition attachment; filename="recibo-<periodo>.pdf". El recibo debe estar en la lista del propio empleado (GET /me/payslips): uno ajeno o inexistente responde 404 SSVSLF0003 sin distinguirlos. 409 SSVSLF0004 si el PDF aún no está acuñado o confirmado.',
+        tags: [TAG],
+        permission: READ_PERMISSION,
+        params: PayslipContentParamsDto,
+        response: {
+          description: "PDF del recibo.",
+          raw: {
+            content: {
+              "application/pdf": { schema: { type: "string", format: "binary" } },
+            },
+          },
+        },
+        errors: [
+          ...AUTHENTICATED_ROUTE_ERRORS,
+          "VALIDATION_FAILED",
+          "SELF_PROFILE_NOT_LINKED",
+          "SELF_PAYSLIP_NOT_FOUND",
+          "SELF_PAYSLIP_DOCUMENT_PENDING",
+          "SELF_UPSTREAM_UNAVAILABLE",
+        ],
+      }),
+    },
+    (request, reply) => controller.payslipContent(request, reply),
   );
 
   app.post(

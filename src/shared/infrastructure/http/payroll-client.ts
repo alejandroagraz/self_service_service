@@ -53,11 +53,12 @@ const parseRow = (raw: unknown): EmployeePayslipSummaryDto | null => {
     payrollRunId,
     periodLabel: asString(r.periodLabel) ?? "",
     paymentDate: asString(r.paymentDate) ?? "",
-    grossAmountBs: asString(r.grossAmountBs) ?? "0,00",
-    deductionsBs: asString(r.deductionsBs) ?? "0,00",
-    netAmountBs: asString(r.netAmountBs) ?? "0,00",
-    referenceAmountUsd: asString(r.referenceAmountUsd) ?? "0,00",
-    bcvRateApplied: asString(r.bcvRateApplied) ?? "0,0000",
+    // Sin respaldo inventado: un monto o una tasa ausente (o vacía) viaja como `null`, nunca como 0.
+    grossAmountBs: asString(r.grossAmountBs),
+    deductionsBs: asString(r.deductionsBs),
+    netAmountBs: asString(r.netAmountBs),
+    referenceAmountUsd: asString(r.referenceAmountUsd),
+    bcvRateApplied: asString(r.bcvRateApplied),
     documentId: nullableString(r.documentId),
   };
 };

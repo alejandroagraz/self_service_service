@@ -29,4 +29,6 @@ export const TOKENS = {
   PayrollClient: Symbol.for("IPayrollClient"),
   AbsencesClient: Symbol.for("IAbsencesClient"),
   TimeClient: Symbol.for("ITimeClient"),
+  // Descarga de confianza del PDF de un recibo propio (GAP-012), clave per-caller ante documents.
+  DocumentsClient: Symbol.for("IDocumentsClient"),
 } as const;

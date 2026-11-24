@@ -47,6 +47,15 @@ export class ClockPunchRequestDto {
   note?: string;
 }
 
+/**
+ * Parámetros de ruta de `GET /me/payslips/:payslipId/content` (GAP-012). Se validan con `validateDto`
+ * (422 `SSVCOM0001` si no es un UUID v4).
+ */
+export class PayslipContentParamsDto {
+  @IsUUID("4")
+  payslipId!: string;
+}
+
 /** Vista agregada de autoservicio del empleado (`GET /me/profile`). */
 export class EmployeeSelfProfileDto {
   @IsUUID()
@@ -84,8 +93,17 @@ export class EmployeeSelfProfileDto {
   @Matches(DATE_PATTERN)
   readonly hireDate!: string;
 
+  /**
+   * Años completos de servicio: el `serviceYears` que calcula people (fuente única,
+   * `completedYearsSince`, GAP-033 §6). El BFF no lo recalcula: si people no lo envía, `null`.
+   */
   @IsInt()
-  readonly seniorityYears!: number;
+  @Doc({
+    nullable: true,
+    description:
+      "Años completos de servicio calculados por people (serviceYears); null si people no lo informa.",
+  })
+  readonly seniorityYears!: number | null;
 
   @IsNumber()
   readonly vacationDaysAvailable!: number;

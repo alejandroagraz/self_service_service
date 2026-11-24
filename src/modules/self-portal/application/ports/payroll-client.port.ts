@@ -7,11 +7,15 @@ export interface EmployeePayslipSummaryDto {
   readonly payrollRunId: string;
   readonly periodLabel: string;
   readonly paymentDate: string;
-  readonly grossAmountBs: string;
-  readonly deductionsBs: string;
-  readonly netAmountBs: string;
-  readonly referenceAmountUsd: string;
-  readonly bcvRateApplied: string;
+  /**
+   * Montos y tasa tal como los formatea payroll (es-VE). `null` si payroll no los envía o llegan
+   * vacíos: un dato ausente nunca se convierte en un 0 inventado.
+   */
+  readonly grossAmountBs: string | null;
+  readonly deductionsBs: string | null;
+  readonly netAmountBs: string | null;
+  readonly referenceAmountUsd: string | null;
+  readonly bcvRateApplied: string | null;
   readonly documentId: string | null;
 }
 

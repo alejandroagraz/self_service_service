@@ -2,7 +2,7 @@
  * Validación fail-fast de variables de entorno (envalid) de `self_service_service`.
  *
  * `self_service` es un BFF/agregador: compone la vista de autoservicio del empleado leyendo a sus
- * hermanos (people, payroll, absences, time) y persiste únicamente sus marcaciones de reloj
+ * hermanos (people, payroll, absences, time, documents) y persiste únicamente sus marcaciones de reloj
  * (`clock_punches`).
  *
  * Compose traduce `POSTGRES_SELF_SERVICE_*`/`RABBITMQ_SELF_SERVICE_*` del `.env` raíz a
@@ -154,6 +154,13 @@ export const env = cleanEnv(withEmptyAsUnset(process.env), {
     default: "/run/secrets/self_service_time_internal_key",
   }),
 
+  // documents: descarga de confianza del PDF de un recibo propio (GAP-012), clave per-caller dedicada
+  // de self_service. NO reenvía el token del usuario: la pertenencia la verifica el BFF antes.
+  DOCUMENTS_INTERNAL_URL: str({ default: "http://documents-api:3005" }),
+  DOCUMENTS_INTERNAL_KEY_SELF_SERVICE_FILE: str({
+    default: "/run/secrets/documents_internal_key_self_service",
+  }),
+
   // ===== Rate limiting global (rulebook §10.1) =====
   GLOBAL_RATE_LIMIT_MAX: rateLimitMax({ default: 300 }),
   GLOBAL_RATE_LIMIT_WINDOW_MS: rateLimitWindowMs({ default: 60_000 }),
@@ -181,8 +188,8 @@ export const env = cleanEnv(withEmptyAsUnset(process.env), {
  * Ningún secreto se acepta ya como variable de entorno (rulebook §9.2). `POSTGRES_MIGRATOR_PASSWORD`
  * entra en la lista aunque este fichero no la lea nunca: el runtime se conecta como
  * `app_self_service` y **no debe poder autenticarse como dueño del schema** (§17.1). El contenedor
- * de migración no carga este módulo, de modo que esta comprobación no le afecta. Las tres claves
- * per-pair de lectura saliente también se vetan como variable: solo se aceptan por fichero.
+ * de migración no carga este módulo, de modo que esta comprobación no le afecta. Las cuatro claves
+ * per-caller de lectura saliente también se vetan como variable: solo se aceptan por fichero.
  */
 assertSecretsNotInEnvironment([
   "POSTGRES_APP_PASSWORD",
@@ -191,6 +198,7 @@ assertSecretsNotInEnvironment([
   "PAYROLL_INTERNAL_READ_KEY",
   "ABSENCES_INTERNAL_READ_KEY",
   "TIME_INTERNAL_READ_KEY",
+  "DOCUMENTS_INTERNAL_KEY_SELF_SERVICE",
   "POSTGRES_MIGRATOR_PASSWORD",
 ]);
 

@@ -99,6 +99,20 @@ export const ERRORS = define({
     statusCode: 503,
     quiet: true,
   },
+  // GAP-012: el recibo pedido no está entre los del empleado autenticado (ajeno o inexistente:
+  // anti-IDOR, no se distingue), o documents no encuentra su PDF. Nunca se filtra el detalle.
+  SELF_PAYSLIP_NOT_FOUND: {
+    code: "SSVSLF0003",
+    message: "El recibo solicitado no existe.",
+    statusCode: 404,
+  },
+  // GAP-012: el recibo es del empleado pero su PDF aún no está disponible (`documentId` vacío en
+  // payroll, o documents lo tiene sin confirmar).
+  SELF_PAYSLIP_DOCUMENT_PENDING: {
+    code: "SSVSLF0004",
+    message: "El PDF del recibo aún no está disponible; inténtelo más tarde.",
+    statusCode: 409,
+  },
 
   // ===== CLK — clock punches (marcaciones de reloj del empleado, por tenant) =====
   CLOCK_PUNCH_INVALID: {

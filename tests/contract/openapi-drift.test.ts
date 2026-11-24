@@ -70,6 +70,9 @@ after(async () => {
 
 const routeKey = (method: string, url: string): string => `${method} ${url}`;
 
+/** Path de Fastify (`/x/:id`) al formato del documento OpenAPI (`/x/{id}`). */
+const toOpenapiPath = (url: string): string => url.replace(/:([A-Za-z0-9_]+)/g, "{$1}");
+
 const documentedRoutes = () => {
   const catalog = routeCatalogOf(h.app);
   const required =
@@ -148,7 +151,7 @@ test("el documento publicado no contiene operaciones x-internal y sí las rutas 
     if (!required.has(key) || route.schema?.["x-internal"] === true) {
       continue;
     }
-    const operation = document.paths[route.url]?.[route.method.toLowerCase()];
+    const operation = document.paths[toOpenapiPath(route.url)]?.[route.method.toLowerCase()];
     assert.ok(operation !== undefined, `${key}: falta en el documento publicado`);
     assert.equal(operation.operationId, route.schema?.operationId);
     assert.equal(operation["x-permission"], route.schema?.["x-permission"]);

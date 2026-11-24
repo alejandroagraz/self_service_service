@@ -21,6 +21,11 @@ export interface MyProfileDto {
   readonly supervisorName: string | null;
   readonly site: string;
   readonly hireDate: string;
+  /**
+   * Años completos de servicio calculados por people (`completedYearsSince`, fuente única, GAP-033
+   * §6). `null` si people no lo informa (o no es un entero >= 0): el BFF NO lo recalcula.
+   */
+  readonly serviceYears: number | null;
 }
 
 export interface IPeopleClient {

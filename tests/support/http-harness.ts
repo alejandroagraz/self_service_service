@@ -3,9 +3,11 @@
  * rutas, preHandlers, manejador de errores, OpenAPI) con dobles en los bordes:
  *
  *   - Un servidor HTTP local (`node:http`) hace de identity (`/sessions/verify`), de people
- *     (`/employees/me`) y de time (`/time/internal/active-shift`). Los clientes REALES
- *     (`IdentityClient`, `PeopleClient`, `TimeClient`) le hablan por red, así que también se prueban
- *     su parseo y su mapeo de errores, sin depender de people real (que otro agente está ampliando).
+ *     (`/employees/me`), de time (`/time/internal/active-shift`), de payroll
+ *     (`/payroll/internal/payslips`) y de documents (`/documents/internal/:id/content`). Los clientes
+ *     REALES (`IdentityClient`, `PeopleClient`, `TimeClient`, `PayrollClient`, `DocumentsClient`) le
+ *     hablan por red, así que también se prueban su parseo y su mapeo de errores, sin depender de los
+ *     servicios reales (que otros agentes están ampliando).
  *   - La Unidad de Trabajo es en memoria y respeta el aislamiento por tenant (el RLS real lo cubre
  *     `tests/invariants/rls.test.ts` contra PostgreSQL) y la atomicidad (nada se guarda si el job
  *     lanza).
@@ -35,6 +37,7 @@ import type {
 } from "../../src/shared/domain/repositories/unit-of-work.interface";
 import type { IClock } from "../../src/shared/domain/services/clock.interface";
 import { AbsencesClient } from "../../src/shared/infrastructure/http/absences-client";
+import { DocumentsClient } from "../../src/shared/infrastructure/http/documents-client";
 import { IdentityClient } from "../../src/shared/infrastructure/http/identity-client";
 import { PayrollClient } from "../../src/shared/infrastructure/http/payroll-client";
 import { PeopleClient } from "../../src/shared/infrastructure/http/people-client";
@@ -45,6 +48,8 @@ import { UuidV4IdGenerator } from "../../src/shared/infrastructure/services/uuid
 import { rootLogger } from "../../src/shared/infrastructure/services/winston-logger";
 
 export const API = "/api/v1/self-service";
+/** Clave de relleno de los clientes de confianza (no es un secreto de ningún entorno). */
+export const TEST_SERVICE_KEY = "test-key-not-a-secret";
 const UPSTREAM_TIMEOUT_MS = 2_000;
 
 // ───────────────────────────── Reloj manual ─────────────────────────────
@@ -194,14 +199,47 @@ export interface UpstreamState {
   /** token → principal que devuelve `/sessions/verify` (ausente → 401). */
   principals: Map<string, TestPrincipal>;
   /** token → ficha de `/employees/me` (ausente → 404 EMPLOYEE_NOT_LINKED). */
-  employees: Map<string, { employeeId: string; userId: string; fullName: string }>;
+  employees: Map<string, TestEmployee>;
   /** Fuerza el status de `/employees/me` (p. ej. 503 = people caído). */
   peopleStatus: number | null;
   /** Respuesta de `/time/internal/active-shift`. */
   activeShift: UpstreamResponse;
   /** Peticiones recibidas en `active-shift` (para verificar cabeceras y query). */
   activeShiftCalls: { employeeId: string | null; tenantId: string | undefined }[];
+  /** employeeId → filas de `/payroll/internal/payslips` (ausente → lista vacía). */
+  payslips: Map<string, readonly Record<string, unknown>[]>;
+  /** Fuerza el status de `/payroll/internal/payslips` (p. ej. 503 = payroll caído). */
+  payrollStatus: number | null;
+  /** Peticiones recibidas en payroll `internal/payslips`. */
+  payrollCalls: { employeeId: string | null; tenantId: string | undefined }[];
+  /** documentId → respuesta de documents `/internal/:id/content` (ausente → 404). */
+  documents: Map<string, { status: number; pdf?: Buffer }>;
+  /** Peticiones recibidas en documents `/internal/:id/content` (cabeceras de confianza). */
+  documentsCalls: DocumentsCall[];
 }
+
+export interface TestEmployee {
+  readonly employeeId: string;
+  readonly userId: string;
+  readonly fullName: string;
+  /** `serviceYears` que devolvería people (GAP-033 §6); ausente → el campo no viaja. */
+  readonly serviceYears?: unknown;
+}
+
+export interface DocumentsCall {
+  readonly documentId: string;
+  readonly tenantId: string | undefined;
+  readonly serviceName: string | undefined;
+  readonly apiKey: string | undefined;
+  readonly authorization: string | undefined;
+}
+
+const headerOf = (req: IncomingMessage, name: string): string | undefined => {
+  const value = req.headers[name];
+  return typeof value === "string" ? value : undefined;
+};
+
+const DOCUMENT_CONTENT_PATH = /^\/api\/v1\/documents\/internal\/([^/]+)\/content$/;
 
 const send = (res: ServerResponse, status: number, body: unknown): void => {
   res.writeHead(status, { "content-type": "application/json" });
@@ -271,6 +309,46 @@ const handle = (state: UpstreamState, req: IncomingMessage, res: ServerResponse)
     send(res, state.activeShift.status, state.activeShift.body);
     return;
   }
+  if (url.pathname === "/api/v1/payroll/internal/payslips") {
+    const employeeId = url.searchParams.get("employeeId");
+    state.payrollCalls.push({ employeeId, tenantId: headerOf(req, "x-tenant-id") });
+    if (state.payrollStatus !== null) {
+      send(res, state.payrollStatus, { success: false, code: "PAYCOM0004", data: null });
+      return;
+    }
+    send(res, 200, {
+      success: true,
+      statusCode: 200,
+      data: state.payslips.get(employeeId ?? "") ?? [],
+    });
+    return;
+  }
+  const documentMatch = DOCUMENT_CONTENT_PATH.exec(url.pathname);
+  if (documentMatch !== null) {
+    const documentId = decodeURIComponent(documentMatch[1]);
+    state.documentsCalls.push({
+      documentId,
+      tenantId: headerOf(req, "x-tenant-id"),
+      serviceName: headerOf(req, "x-service-name"),
+      apiKey: headerOf(req, "x-internal-api-key"),
+      authorization: headerOf(req, "authorization"),
+    });
+    const document = state.documents.get(documentId);
+    if (document === undefined) {
+      send(res, 404, { success: false, code: "DOCDOC0001", data: null });
+      return;
+    }
+    if (document.status !== 200 || document.pdf === undefined) {
+      send(res, document.status, { success: false, code: "DOCDOC0009", data: null });
+      return;
+    }
+    res.writeHead(200, {
+      "content-type": "application/pdf",
+      "content-length": String(document.pdf.length),
+    });
+    res.end(document.pdf);
+    return;
+  }
   send(res, 404, { success: false, code: "NOTFOUND", data: null });
 };
 
@@ -290,6 +368,11 @@ export const buildHarness = async (): Promise<Harness> => {
     peopleStatus: null,
     activeShift: { status: 200, body: { success: true, data: { shiftName: null } } },
     activeShiftCalls: [],
+    payslips: new Map(),
+    payrollStatus: null,
+    payrollCalls: [],
+    documents: new Map(),
+    documentsCalls: [],
   };
   const server: Server = createServer((req, res) => {
     handle(upstream, req, res);
@@ -302,7 +385,7 @@ export const buildHarness = async (): Promise<Harness> => {
   const uow = new InMemoryUnitOfWork();
   const clock = new ManualClock();
   // Claves de relleno: el doble no las comprueba y no son secretos de ningún entorno.
-  const key = "test-key-not-a-secret";
+  const key = TEST_SERVICE_KEY;
   container.registerInstance(TOKENS.Logger, rootLogger());
   container.registerInstance(TOKENS.Clock, clock);
   container.registerInstance(TOKENS.UnitOfWork, uow);
@@ -325,6 +408,10 @@ export const buildHarness = async (): Promise<Harness> => {
     new AbsencesClient(baseUrl, key, UPSTREAM_TIMEOUT_MS),
   );
   container.registerInstance(TOKENS.TimeClient, new TimeClient(baseUrl, key, UPSTREAM_TIMEOUT_MS));
+  container.registerInstance(
+    TOKENS.DocumentsClient,
+    new DocumentsClient(baseUrl, key, UPSTREAM_TIMEOUT_MS),
+  );
 
   const app = await buildHttpApp();
   await app.ready();

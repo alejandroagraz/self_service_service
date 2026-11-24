@@ -5,6 +5,7 @@
     "GET /api/v1/self-service/me/profile",
     "GET /api/v1/self-service/me/clock-status",
     "POST /api/v1/self-service/me/clock-punch",
+    "GET /api/v1/self-service/me/payslips/:payslipId/content",
     "GET /api/v1/self-service/docs/openapi.json"
   ]
 }

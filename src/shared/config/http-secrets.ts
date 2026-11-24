@@ -1,12 +1,14 @@
 /**
  * Secretos del rol HTTP (rulebook §10.4, §13).
  *
- * `self_service` es un BFF: su rol HTTP necesita CUATRO materiales, todos de 43 chars base64url:
+ * `self_service` es un BFF: su rol HTTP necesita CINCO materiales, todos de 43 chars base64url:
  *   - `internalApiKey` — clave interna de servicio (decisión D1). Función OUTBOUND: self_service se
  *     identifica ante `identity` al validar el token de un usuario.
  *   - `payrollReadKey` / `absencesReadKey` / `timeReadKey` — claves PER-PAIR de lectura SALIENTE
  *     (decisión D2, per-caller). Cada hermano valida a self_service contra SU propia clave dedicada;
  *     self_service presenta la clave correcta a cada uno. El compromiso de una no habilita a otra.
+ *   - `documentsReadKey` — clave per-caller de self_service ante `documents` (GAP-012): descarga del PDF
+ *     de un recibo YA verificado como propio. Ruta interna `/documents/internal/:id/content`.
  *
  * Todos llegan como Docker secrets, montados **solo** en el contenedor HTTP de self_service; `env.ts`
  * solo conoce sus rutas (`*_FILE`). Se leen una vez, al construir el servidor HTTP (`buildHttpServer`),
@@ -26,6 +28,7 @@ export interface HttpSecrets {
   readonly payrollReadKey: string;
   readonly absencesReadKey: string;
   readonly timeReadKey: string;
+  readonly documentsReadKey: string;
 }
 
 /** Lee y valida una clave de 43 chars base64url; el error NO cita el valor, solo la regla. */
@@ -53,4 +56,8 @@ export const loadHttpSecrets = (): HttpSecrets => ({
     env.ABSENCES_INTERNAL_READ_KEY_FILE,
   ),
   timeReadKey: readServiceKey("TIME_INTERNAL_READ_KEY_FILE", env.TIME_INTERNAL_READ_KEY_FILE),
+  documentsReadKey: readServiceKey(
+    "DOCUMENTS_INTERNAL_KEY_SELF_SERVICE_FILE",
+    env.DOCUMENTS_INTERNAL_KEY_SELF_SERVICE_FILE,
+  ),
 });
