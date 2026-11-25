@@ -3,14 +3,15 @@
  * Expuestas por Traefik y de cara al usuario autenticado. Cada una exige token válido (`authenticate`)
  * y el permiso correspondiente del catálogo de identity:
  *   - lecturas del propio empleado (`/me/profile`, `/me/clock-status`, `/me/payslips`,
- *     `/me/payslips/:payslipId/content`, `/me/celebrations`, `/me/punctuality`): `self_service:read`.
+ *     `/me/payslips/:payslipId/content`, `/me/celebrations`, `/me/absences`, `/me/punctuality`):
+ *     `self_service:read`.
  *   - lectura de manager (`/me/team-status`): `team:read` (si falta, el preHandler responde 403).
  *   - escritura (`/me/clock-punch`): `self_service:punch`.
  *
  * La ruta solo declara método, path, hooks y su `schema` de documentación, y delega en el controller
  * resuelto del contenedor. DEC-16 = A (modo transitorio): las rutas nuevas o modificadas desde el Lote
- * 3.3 (`/me/profile`, `/me/clock-status`, `/me/clock-punch`, y desde el 4.2
- * `/me/payslips/:payslipId/content`) declaran `schema` (`routeSchema`); el
+ * 3.3 (`/me/profile`, `/me/clock-status`, `/me/clock-punch`, desde el 4.2
+ * `/me/payslips/:payslipId/content` y desde el 4.4A `/me/absences`) declaran `schema` (`routeSchema`); el
  * resto lo completa el Lote 6.1. El `schema` NO valida: class-validator sigue siendo el validador.
  */
 import type { FastifyInstance } from "fastify";
@@ -29,6 +30,9 @@ import {
   ClockPunchResultDto,
   ClockStatusDto,
   EmployeeSelfProfileDto,
+  MyAbsenceRequestDto,
+  MyAbsencesQueryDto,
+  MyMonthAbsenceDto,
   PayslipContentParamsDto,
 } from "../../../application/dtos/self-portal.dto";
 import { SelfPortalController } from "../controllers/self-portal.controller";
@@ -173,7 +177,28 @@ export const registerSelfPortalRoutes = (app: FastifyInstance): void => {
 
   app.get(
     "/me/absences",
-    { preHandler: [authenticate, requirePermission("self_service:read")] },
+    {
+      preHandler: [authenticate, requirePermission(READ_PERMISSION)],
+      schema: routeSchema({
+        operationId: "listMyAbsences",
+        summary: "Ausencias del empleado autenticado: del mes (calendario) o solicitudes del año.",
+        description:
+          "?year=AAAA (2000–2100): todas las solicitudes propias cuyo rango intersecta el año, de cualquier estado, por startDate desc y sin paginar (ítems MyAbsenceRequestDto, GAP-022 §5). ?month=AAAA-MM, o sin ninguno (mes corriente UTC): ausencias del mes para el calendario (ítems MyMonthAbsenceDto). year y month juntos, un parámetro repetido o un year fuera de rango → 422 SSVCOM0001. absences caído → 503 SSVSLF0002.",
+        tags: [TAG],
+        permission: READ_PERMISSION,
+        querystring: MyAbsencesQueryDto,
+        response: {
+          description: "Ausencias del mes o solicitudes del año.",
+          list: [MyAbsenceRequestDto, MyMonthAbsenceDto],
+        },
+        errors: [
+          ...AUTHENTICATED_ROUTE_ERRORS,
+          "VALIDATION_FAILED",
+          "SELF_PROFILE_NOT_LINKED",
+          "SELF_UPSTREAM_UNAVAILABLE",
+        ],
+      }),
+    },
     (request, reply) => controller.absences(request, reply),
   );
 

@@ -48,6 +48,11 @@ export interface RouteDocs {
     readonly description: string;
     /** DTO del `data` del envelope `ResponseDto<T>` (respuesta 200). */
     readonly data?: DtoClass;
+    /**
+     * `data` es una LISTA cuyos ítems son de alguna de estas clases (varias → `anyOf`, p. ej. según la
+     * query) y el envelope lleva `meta.total`. Excluyente con `data`.
+     */
+    readonly list?: readonly [DtoClass, ...DtoClass[]];
     /** Esquema de una respuesta 200 que NO usa el envelope (p. ej. el propio documento OpenAPI). */
     readonly raw?: JsonSchema;
   };
@@ -120,16 +125,31 @@ export const dtoSchema = (dto: DtoClass): JsonSchema => {
   return inlineRefs(schema, all, [dto.name]) as JsonSchema;
 };
 
-const successEnvelope = (data: JsonSchema, description: string): JsonSchema => ({
+const successEnvelope = (data: JsonSchema, description: string, withTotal = false): JsonSchema => ({
   description,
   type: "object",
-  required: ["success", "statusCode", "message", "data"],
+  required: ["success", "statusCode", "message", "data", ...(withTotal ? ["meta"] : [])],
   properties: {
     success: { type: "boolean", enum: [true] },
     statusCode: { type: "integer", enum: [200] },
     message: { type: "string" },
     data,
+    ...(withTotal
+      ? {
+          meta: {
+            type: "object",
+            required: ["total"],
+            properties: { total: { type: "integer", minimum: 0 } },
+          },
+        }
+      : {}),
   },
+});
+
+/** Esquema de una lista cuyos ítems son de alguna de las clases dadas. */
+const listSchema = (items: readonly [DtoClass, ...DtoClass[]]): JsonSchema => ({
+  type: "array",
+  items: items.length === 1 ? dtoSchema(items[0]) : { anyOf: items.map(dtoSchema) },
 });
 
 const errorEnvelope = (statusCode: number, keys: readonly ErrorKey[]): JsonSchema => ({
@@ -162,8 +182,17 @@ export const routeSchema = (docs: RouteDocs): DocumentedRouteSchema => {
     byStatus.set(status, [...(byStatus.get(status) ?? []), key]);
   }
   const response: Record<string, JsonSchema> = {};
+  if (docs.response.data !== undefined && docs.response.list !== undefined) {
+    throw new Error(`OpenAPI: ${docs.operationId} declara a la vez data y list.`);
+  }
   if (docs.response.data !== undefined) {
     response["200"] = successEnvelope(dtoSchema(docs.response.data), docs.response.description);
+  } else if (docs.response.list !== undefined) {
+    response["200"] = successEnvelope(
+      listSchema(docs.response.list),
+      docs.response.description,
+      true,
+    );
   } else {
     response["200"] = { description: docs.response.description, ...(docs.response.raw ?? {}) };
   }

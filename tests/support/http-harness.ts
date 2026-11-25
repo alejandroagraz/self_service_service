@@ -4,8 +4,10 @@
  *
  *   - Un servidor HTTP local (`node:http`) hace de identity (`/sessions/verify`), de people
  *     (`/employees/me`), de time (`/time/internal/active-shift`), de payroll
- *     (`/payroll/internal/payslips`) y de documents (`/documents/internal/:id/content`). Los clientes
- *     REALES (`IdentityClient`, `PeopleClient`, `TimeClient`, `PayrollClient`, `DocumentsClient`) le
+ *     (`/payroll/internal/payslips`), de absences (`/absences/internal/leave-balance`,
+ *     `employee-month-absences` y `employee-requests`) y de documents
+ *     (`/documents/internal/:id/content`). Los clientes REALES (`IdentityClient`, `PeopleClient`,
+ *     `TimeClient`, `PayrollClient`, `AbsencesClient`, `DocumentsClient`) le
  *     hablan por red, así que también se prueban su parseo y su mapeo de errores, sin depender de los
  *     servicios reales (que otros agentes están ampliando).
  *   - La Unidad de Trabajo es en memoria y respeta el aislamiento por tenant (el RLS real lo cubre
@@ -216,6 +218,21 @@ export interface UpstreamState {
   documents: Map<string, { status: number; pdf?: Buffer }>;
   /** Peticiones recibidas en documents `/internal/:id/content` (cabeceras de confianza). */
   documentsCalls: DocumentsCall[];
+  /** Respuesta de absences `/internal/employee-month-absences`. */
+  monthAbsences: UpstreamResponse;
+  /** Respuesta de absences `/internal/employee-requests` (contrato 4.4A §1.4). */
+  absenceRequests: UpstreamResponse;
+  /** Peticiones recibidas en absences `employee-month-absences` y `employee-requests`. */
+  absencesCalls: AbsencesCall[];
+}
+
+export interface AbsencesCall {
+  readonly path: string;
+  readonly query: Readonly<Record<string, string>>;
+  readonly tenantId: string | undefined;
+  readonly serviceName: string | undefined;
+  readonly apiKey: string | undefined;
+  readonly authorization: string | undefined;
 }
 
 export interface TestEmployee {
@@ -300,6 +317,24 @@ const handle = (state: UpstreamState, req: IncomingMessage, res: ServerResponse)
     });
     return;
   }
+  if (
+    url.pathname === "/api/v1/absences/internal/employee-month-absences" ||
+    url.pathname === "/api/v1/absences/internal/employee-requests"
+  ) {
+    state.absencesCalls.push({
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams.entries()),
+      tenantId: headerOf(req, "x-tenant-id"),
+      serviceName: headerOf(req, "x-service-name"),
+      apiKey: headerOf(req, "x-internal-api-key"),
+      authorization: headerOf(req, "authorization"),
+    });
+    const response = url.pathname.endsWith("/employee-requests")
+      ? state.absenceRequests
+      : state.monthAbsences;
+    send(res, response.status, response.body);
+    return;
+  }
   if (url.pathname === "/api/v1/time/internal/active-shift") {
     const tenantHeader = req.headers["x-tenant-id"];
     state.activeShiftCalls.push({
@@ -373,6 +408,9 @@ export const buildHarness = async (): Promise<Harness> => {
     payrollCalls: [],
     documents: new Map(),
     documentsCalls: [],
+    monthAbsences: { status: 200, body: { success: true, data: [] } },
+    absenceRequests: { status: 200, body: { success: true, data: [] } },
+    absencesCalls: [],
   };
   const server: Server = createServer((req, res) => {
     handle(upstream, req, res);

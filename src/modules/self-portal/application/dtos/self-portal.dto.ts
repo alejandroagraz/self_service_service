@@ -7,7 +7,9 @@ import {
   IsString,
   IsUUID,
   Matches,
+  Max,
   MaxLength,
+  Min,
 } from "class-validator";
 
 import { Doc } from "../../../../shared/application/dto-docs";
@@ -293,11 +295,75 @@ export interface EmployeePunctualityDto {
   readonly workedMinutesToday: number;
 }
 
-/** Un ítem de ausencia del mes del empleado para el calendario (`GET /me/absences`). */
-export interface MyMonthAbsenceDto {
-  readonly category: string;
-  readonly startDate: string;
-  readonly endDate: string;
+/**
+ * Query de `GET /me/absences` (SOLO documentación del OpenAPI): la valida el controller a mano,
+ * porque `validateDto` rechazaría cualquier otro parámetro de la query y cambiaría la respuesta del
+ * modo mes. `year` y `month` son excluyentes (ambos → 422 `SSVCOM0001`); sin ninguno, mes corriente.
+ */
+export class MyAbsencesQueryDto {
+  @IsOptional()
+  @Matches(/^\d{4}-(0[1-9]|1[0-2])$/)
+  @Doc({ description: "AAAA-MM. Ausencias aprobadas del mes (calendario). Excluyente con year." })
+  month?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(2000)
+  @Max(2100)
+  @Doc({
+    description: "AAAA (2000–2100). Todas las solicitudes propias del año. Excluyente con month.",
+  })
+  year?: number;
+}
+
+/** Un ítem de ausencia del mes del empleado para el calendario (`GET /me/absences?month=`). */
+export class MyMonthAbsenceDto {
+  @IsString()
+  readonly category!: string;
+
+  @Matches(DATE_PATTERN)
+  readonly startDate!: string;
+
+  @Matches(DATE_PATTERN)
+  readonly endDate!: string;
+}
+
+/**
+ * Una solicitud de ausencia propia, de cualquier estado (`GET /me/absences?year=`). Campos y orden del
+ * contrato `employee-requests` de absences (4.4A §1.4), sin añadir ni quitar.
+ */
+export class MyAbsenceRequestDto {
+  @IsUUID()
+  readonly id!: string;
+
+  @IsString()
+  readonly category!: string;
+
+  @IsString()
+  readonly policyName!: string;
+
+  @Matches(DATE_PATTERN)
+  readonly startDate!: string;
+
+  @Matches(DATE_PATTERN)
+  readonly endDate!: string;
+
+  @IsInt()
+  readonly businessDays!: number;
+
+  @IsString()
+  readonly status!: string;
+
+  @IsString()
+  readonly reason!: string;
+
+  @IsString()
+  @Doc({ nullable: true })
+  readonly rejectionReason!: string | null;
+
+  @IsString()
+  @Doc({ format: "date-time" })
+  readonly createdAt!: string;
 }
 
 /** Miembro del equipo (vista de manager, `GET /me/team-status`). */

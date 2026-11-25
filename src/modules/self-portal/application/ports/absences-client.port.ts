@@ -19,6 +19,23 @@ export interface EmployeeMonthAbsenceDto {
   readonly endDate: string;
 }
 
+/**
+ * Una solicitud de ausencia del empleado (cualquier estado), tal como la devuelve la ruta interna
+ * `employee-requests` de absences (contrato 4.4A §1.4). Mismo orden de campos que el contrato.
+ */
+export interface EmployeeAbsenceRequestDto {
+  readonly id: string;
+  readonly category: string;
+  readonly policyName: string;
+  readonly startDate: string;
+  readonly endDate: string;
+  readonly businessDays: number;
+  readonly status: string;
+  readonly reason: string;
+  readonly rejectionReason: string | null;
+  readonly createdAt: string;
+}
+
 export interface IAbsencesClient {
   getLeaveBalance(tenantId: string, employeeId: string): Promise<LeaveBalanceDto>;
   /**
@@ -30,4 +47,14 @@ export interface IAbsencesClient {
     employeeId: string,
     month: string,
   ): Promise<readonly EmployeeMonthAbsenceDto[]>;
+  /**
+   * TODAS las solicitudes del empleado cuyo rango intersecta `year` (cualquier estado), por
+   * `startDate` desc y sin paginar. PRIMARIO de `GET /me/absences?year=`: su caída SÍ rompe ese
+   * endpoint (503). No reenvía el token del usuario.
+   */
+  listEmployeeRequests(
+    tenantId: string,
+    employeeId: string,
+    year: number,
+  ): Promise<readonly EmployeeAbsenceRequestDto[]>;
 }

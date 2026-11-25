@@ -36,6 +36,7 @@ import { GetMyTeamStatusUseCase } from "../../../application/use-cases/get-my-te
 import { GreetCelebrationUseCase } from "../../../application/use-cases/greet-celebration.use-case";
 import { ListMyCelebrationsUseCase } from "../../../application/use-cases/list-my-celebrations.use-case";
 import { ListMyPayslipsUseCase } from "../../../application/use-cases/list-my-payslips.use-case";
+import { ListMyYearAbsenceRequestsUseCase } from "../../../application/use-cases/list-my-year-absence-requests.use-case";
 import { PunchClockUseCase } from "../../../application/use-cases/punch-clock.use-case";
 import { UngreetCelebrationUseCase } from "../../../application/use-cases/ungreet-celebration.use-case";
 
@@ -47,6 +48,9 @@ interface SelfPortalQuery {
 }
 
 const MONTH_PATTERN = /^\d{4}-(0[1-9]|1[0-2])$/;
+const YEAR_PATTERN = /^\d{4}$/;
+const MIN_YEAR = 2000;
+const MAX_YEAR = 2100;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -65,6 +69,26 @@ const isRealCalendarDate = (value: string): boolean => {
   );
 };
 
+/** `AAAA` dentro de [2000, 2100] (GAP-022 §4), o `undefined`. */
+const toYear = (value: string): number | undefined => {
+  if (!YEAR_PATTERN.test(value)) {
+    return undefined;
+  }
+  const year = Number(value);
+  return year >= MIN_YEAR && year <= MAX_YEAR ? year : undefined;
+};
+
+/**
+ * Valor único de un parámetro de query: `undefined` si falta o va vacío, `null` si llega repetido
+ * (Fastify lo entrega como lista), o la cadena recortada.
+ */
+const singleQueryValue = (value: unknown): string | null | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+  return typeof value === "string" ? toOptionalString(value) : null;
+};
+
 @singleton()
 export class SelfPortalController {
   constructor(
@@ -77,6 +101,8 @@ export class SelfPortalController {
     @inject(GetMyTeamStatusUseCase) private readonly getMyTeamStatus: GetMyTeamStatusUseCase,
     @inject(GetMyMonthAbsencesUseCase)
     private readonly getMyMonthAbsences: GetMyMonthAbsencesUseCase,
+    @inject(ListMyYearAbsenceRequestsUseCase)
+    private readonly listMyYearAbsenceRequests: ListMyYearAbsenceRequestsUseCase,
     @inject(GreetCelebrationUseCase) private readonly greetCelebration: GreetCelebrationUseCase,
     @inject(UngreetCelebrationUseCase)
     private readonly ungreetCelebration: UngreetCelebrationUseCase,
@@ -199,10 +225,43 @@ export class SelfPortalController {
     return reply.status(200).send(ok(data, "Felicitación retirada con éxito."));
   }
 
+  /**
+   * `GET /me/absences`: `?year=AAAA` → todas las solicitudes propias del año (cualquier estado);
+   * `?month=AAAA-MM` o sin ninguno → ausencias del mes (respuesta de siempre, mes corriente por
+   * defecto). `year` y `month` juntos, un parámetro repetido o un `year` fuera de 2000–2100 → 422.
+   */
   async absences(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
     const principal = principalOf(request);
-    const month = toOptionalString((request.query as SelfPortalQuery).month);
-    if (month !== undefined && !MONTH_PATTERN.test(month)) {
+    const query = request.query as Readonly<Record<string, unknown>>;
+    const month = singleQueryValue(query.month);
+    const year = singleQueryValue(query.year);
+    if (month !== undefined && year !== undefined) {
+      throw fail("VALIDATION_FAILED", [
+        { field: "year", issue: "`year` y `month` son excluyentes; envíe solo uno." },
+      ]);
+    }
+    if (year !== undefined) {
+      const parsedYear = year === null ? undefined : toYear(year);
+      if (parsedYear === undefined) {
+        throw fail("VALIDATION_FAILED", [
+          {
+            field: "year",
+            issue: `Se requiere un \`year\` AAAA entre ${String(MIN_YEAR)} y ${String(MAX_YEAR)}.`,
+          },
+        ]);
+      }
+      const requests = await this.listMyYearAbsenceRequests.execute(
+        principal.tenantId,
+        bearerOf(request),
+        parsedYear,
+      );
+      return reply.status(200).send(
+        ok(requests, "Solicitudes de ausencia del año obtenidas con éxito.", {
+          total: requests.length,
+        }),
+      );
+    }
+    if (month === null || (month !== undefined && !MONTH_PATTERN.test(month))) {
       throw fail("VALIDATION_FAILED", [
         { field: "month", issue: "Se requiere un `month` con formato AAAA-MM." },
       ]);
