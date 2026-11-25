@@ -1,0 +1,226 @@
+# =====================================================================================================
+# PLANTILLA — build-testing.yml (GitHub Actions → GHCR → Dokploy)
+#
+# Se copia a `.github/workflows/build-testing.yml` de CADA repo de aplicación (los 7 backends y
+# frontend_rrhh). Las copias ya rellenas por repo están en workflows/<repo>/.github/workflows/; las
+# genera `workflows/render.sh` a partir de esta plantilla. Solo cambian 3 valores (bloque `env`):
+#   IMAGE_NAME          fibex-rrhh-<servicio>  (debe coincidir con docker-compose.dokploy.yml)
+#   SEED_SUPPORTED      "true" en backends (stage `build` = imagen de seed), "false" en el frontend
+#   VITE_API_BASE_URL   solo lo usa el frontend (build-arg); los backends lo ignoran
+#
+# Qué hace:
+#   push a develop → build multi-stage (`--target runtime`) con caché de BuildKit en GitHub Actions
+#   (type=gha) → push a GHCR con tags `testing`, `develop` y `sha-<12>` → dispara el despliegue en
+#   Dokploy (API `compose.deploy`, o webhook como alternativa).
+#   workflow_dispatch → lo mismo, y opcionalmente la imagen de seed `testing-seed` (with_seed).
+#
+# Secrets del repo (Settings → Secrets and variables → Actions):
+#   DOKPLOY_URL         p. ej. http://148.113.178.92:3000 (mejor con HTTPS si el panel tiene dominio)
+#   DOKPLOY_API_KEY     API key de Dokploy (Settings → Profile → API/CLI)
+#   DOKPLOY_COMPOSE_ID  id del Compose en Dokploy
+#   DOKPLOY_WEBHOOK_URL (opcional, alternativa a las 3 anteriores) webhook de despliegue del Compose
+# El push a GHCR usa el GITHUB_TOKEN del propio workflow (permiso packages: write): no hace falta PAT.
+# =====================================================================================================
+name: build-testing
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      with_seed:
+        description: "Publicar también la imagen de seed (:testing-seed)"
+        type: boolean
+        default: false
+      deploy:
+        description: "Disparar el despliegue en Dokploy al terminar"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+# CONCURRENCIA (requisito 4). Nivel 1, el run completo por repo y rama: un push nuevo a develop
+# CANCELA el run anterior aún en curso (build o espera de despliegue). Con merges seguidos solo se
+# publica y despliega el último commit; nunca se acumulan builds ni redeploys de commits ya superados.
+# Excepción: un lanzamiento MANUAL solo para publicar la imagen de seed (with_seed=true, deploy=false)
+# va a su propio grupo `-seed`. Así no cancela un build o despliegue de un push a develop en curso, y
+# un push tampoco lo cancela a él.
+concurrency:
+  group: build-testing-${{ github.repository }}-${{ github.ref }}${{ (github.event_name == 'workflow_dispatch' && inputs.with_seed && !inputs.deploy) && '-seed' || '' }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: fibex-rrhh-self-service
+  SEED_SUPPORTED: "true"
+  VITE_API_BASE_URL: /api/v1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      short_sha: ${{ steps.vars.outputs.short_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Variables
+        id: vars
+        shell: bash
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "created=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Imagen de runtime (la que despliega Dokploy). Una sola plataforma (la VPS es amd64) y sin
+      # attestations: el manifiesto queda simple y el pull en la VPS no descarga artefactos de más.
+      - name: Build & push (runtime)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            VITE_API_BASE_URL=${{ env.VITE_API_BASE_URL }}
+          tags: |
+            ${{ steps.vars.outputs.image }}:testing
+            ${{ steps.vars.outputs.image }}:develop
+            ${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=sha-${{ steps.vars.outputs.short_sha }}
+            org.opencontainers.image.created=${{ steps.vars.outputs.created }}
+          # Caché de capas de BuildKit en GitHub Actions. `mode=max` guarda también las stages
+          # intermedias (deps, prod-deps): un push sin cambios en yarn.lock no reinstala dependencias.
+          cache-from: type=gha,scope=${{ env.IMAGE_NAME }}
+          cache-to: type=gha,scope=${{ env.IMAGE_NAME }},mode=max
+
+      # Imagen de seed (stage `build`: devDependencies + dist). Solo a mano y solo en backends.
+      - name: Build & push (seed)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.with_seed && env.SEED_SUPPORTED == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: build
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ steps.vars.outputs.image }}:testing-seed
+            ${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}-seed
+          # Reutiliza las capas `deps` del build de runtime y las propias de la stage `build`.
+          cache-from: |
+            type=gha,scope=${{ env.IMAGE_NAME }}
+            type=gha,scope=${{ env.IMAGE_NAME }}-seed
+          cache-to: type=gha,scope=${{ env.IMAGE_NAME }}-seed,mode=max
+
+      - name: Resumen
+        shell: bash
+        run: |
+          {
+            echo "### Imagen publicada"
+            echo "- \`${{ steps.vars.outputs.image }}:testing\`"
+            echo "- \`${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}\` (rollback: \`<SVC>_IMAGE_TAG=sha-${{ steps.vars.outputs.short_sha }}\` en Dokploy)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.deploy }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Nivel 2, el despliegue. GitHub limita los grupos de concurrencia a cada repo, así que este grupo
+    # serializa los despliegues de ESTE repo y deja como mucho uno pendiente: un pendiente nuevo
+    # reemplaza al anterior. Entre repos distintos coordina el paso de abajo: espera a que Dokploy
+    # termine el despliegue en curso antes de pedir otro, y Dokploy además encola los de una misma app.
+    concurrency:
+      group: dokploy-deploy-testing
+      cancel-in-progress: false
+    env:
+      # Ventana para agrupar merges seguidos: si llega otro push a develop en este repo durante la
+      # espera, este run se cancela (nivel 1) y solo despliega el último. Ajustable con la variable
+      # de repo DEPLOY_DEBOUNCE_S.
+      DEPLOY_DEBOUNCE_S: ${{ vars.DEPLOY_DEBOUNCE_S || '45' }}
+      # Espera máxima a que termine un despliegue de Dokploy en curso (p. ej. de otro repo).
+      DEPLOY_WAIT_MAX_S: ${{ vars.DEPLOY_WAIT_MAX_S || '600' }}
+    steps:
+      - name: Ventana de agrupación (debounce)
+        shell: bash
+        run: sleep "${DEPLOY_DEBOUNCE_S}"
+
+      - name: Disparar despliegue en Dokploy
+        shell: bash
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_COMPOSE_ID: ${{ secrets.DOKPLOY_COMPOSE_ID }}
+          DOKPLOY_WEBHOOK_URL: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          # POST con diagnóstico: guarda la respuesta y, si el código no es 2xx, la imprime en stderr
+          # (401 = API key, 400 = composeId o payload, 404 = URL, 5xx = Dokploy). Nunca imprime la API key.
+          post() { # url json [cabeceras curl...]
+            local url="$1" data="$2"; shift 2
+            local out code
+            out="$(mktemp)"
+            code="$(curl -sS --retry 3 --retry-delay 5 --max-time 30 -o "${out}" -w '%{http_code}' \
+              -X POST "${url}" -H "accept: application/json" -H "Content-Type: application/json" \
+              "$@" -d "${data}")" || code="000"
+            if [ "${code#2}" = "${code}" ]; then
+              echo "::error::Dokploy respondió HTTP ${code} a POST ${url%%\?*}" >&2
+              echo "---- respuesta ----" >&2; cat "${out}" >&2; echo >&2; echo "-------------------" >&2
+              rm -f "${out}"; exit 1
+            fi
+            rm -f "${out}"
+            echo "Dokploy HTTP ${code}"
+          }
+
+          if [ -n "${DOKPLOY_URL}" ] && [ -n "${DOKPLOY_API_KEY}" ] && [ -n "${DOKPLOY_COMPOSE_ID}" ]; then
+            api="${DOKPLOY_URL%/}/api"
+            # No solapar despliegues en la VPS de 4 GB: si Dokploy está desplegando este Compose (p. ej.
+            # por un push de otro repo), esperar a que termine. Si el estado no se puede leer, se sigue.
+            waited=0; status=""
+            while :; do
+              status="$(curl -fsS --max-time 15 -H "x-api-key: ${DOKPLOY_API_KEY}" \
+                "${api}/compose.one?composeId=${DOKPLOY_COMPOSE_ID}" 2>/dev/null \
+                | jq -r '.composeStatus // empty' 2>/dev/null || true)"
+              [ "${status}" = "running" ] || break
+              if [ "${waited}" -ge "${DEPLOY_WAIT_MAX_S}" ]; then
+                echo "::warning::Dokploy sigue desplegando tras ${waited}s; se encola igualmente."; break
+              fi
+              echo "Dokploy está desplegando (composeStatus=running); espero 20 s..."
+              sleep 20; waited=$((waited + 20))
+            done
+            echo "Dokploy API: compose.deploy (estado previo: ${status:-desconocido})"
+            post "${api}/compose.deploy" "{\"composeId\":\"${DOKPLOY_COMPOSE_ID}\"}" -H "x-api-key: ${DOKPLOY_API_KEY}"
+          elif [ -n "${DOKPLOY_WEBHOOK_URL}" ]; then
+            # El webhook de Dokploy valida la rama del payload estilo GitHub: se envía la del Compose.
+            echo "Dokploy webhook"
+            post "${DOKPLOY_WEBHOOK_URL}" \
+              "{\"ref\":\"refs/heads/develop\",\"after\":\"${GITHUB_SHA}\",\"head_commit\":{\"id\":\"${GITHUB_SHA}\",\"message\":\"${GITHUB_REPOSITORY} sha-${GITHUB_SHA::12}\"},\"commits\":[]}" \
+              -H "X-GitHub-Event: push"
+          else
+            echo "::warning::Sin DOKPLOY_* configurados: no se dispara el despliegue."
+            exit 0
+          fi
+          echo "Despliegue solicitado."
