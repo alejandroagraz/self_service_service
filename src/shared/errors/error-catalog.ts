@@ -153,6 +153,47 @@ export const ERRORS = define({
     statusCode: 409,
   },
 
+  // ===== OVT — horas extra excepcionales (GAP-044, Lote 4.4B2; autoridad: people) =====
+  // El BFF traduce los códigos `TIMOVT*` de people (contrato 4.4B2 §5); el sufijo coincide.
+  // La solicitud o la validación no superan las reglas de people (`TIMOVT0001`): justificación,
+  // jornada enlazada ajena o inexistente, minutos sugeridos fuera de rango… Los `errors` se propagan.
+  OVERTIME_REQUEST_INVALID: {
+    code: "SSVOVT0001",
+    message: "La solicitud de horas extra no es válida.",
+    statusCode: 422,
+  },
+  // El tramo pisa horas regulares, una jornada abierta u otra solicitud no rechazada (`TIMOVT0006`).
+  OVERTIME_REQUEST_OVERLAP: {
+    code: "SSVOVT0006",
+    message: "El tramo se solapa con su jornada regular, una jornada abierta u otra solicitud.",
+    statusCode: 409,
+  },
+  // La empresa tiene desactivadas las solicitudes excepcionales (`TIMOVT0008`).
+  OVERTIME_EXCEPTIONS_DISABLED: {
+    code: "SSVOVT0008",
+    message: "Las solicitudes excepcionales de horas extra no están habilitadas.",
+    statusCode: 422,
+  },
+  // La solicitud ya no admite la operación (estado o tipo; p. ej. ya validada) (`TIMOVT0009`).
+  OVERTIME_REQUEST_INVALID_TRANSITION: {
+    code: "SSVOVT0009",
+    message: "El estado de la solicitud de horas extra no admite esta operación.",
+    statusCode: 409,
+  },
+  // El usuario no es el supervisor directo de la solicitud, o no es un supervisor activo
+  // (`TIMOVT0010`). Una solicitud ajena o inexistente responde igual (sin oráculo, D11).
+  OVERTIME_NOT_DIRECT_SUPERVISOR: {
+    code: "SSVOVT0010",
+    message: "No es el supervisor directo responsable de esta solicitud.",
+    statusCode: 403,
+  },
+  // El tramo es futuro o supera 24 horas (`TIMOVT0011`).
+  OVERTIME_REQUEST_INVALID_SPAN: {
+    code: "SSVOVT0011",
+    message: "El tramo de horas extra no puede ser futuro ni superar 24 horas.",
+    statusCode: 422,
+  },
+
   // ===== CGR — celebration greetings (felicitaciones sociales del portal, por tenant) =====
   CELEBRATION_GREETING_INVALID: {
     code: "SSVCGR0001",

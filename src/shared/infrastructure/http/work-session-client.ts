@@ -12,6 +12,9 @@
  *
  * NO reenvía el token del usuario. Las claves NUNCA se escriben en logs ni errores.
  *
+ * Cabeceras, mapeo de errores y fail-closed: núcleo común `time-internal-http.ts` (compartido con
+ * `overtime-client.ts`, Lote 4.4B2).
+ *
  * Resiliencia (como el resto de clientes, `internal-http.ts`): timeout por `AbortController` y
  * reintento interno SOLO ante fallo transitorio (429/5xx/red). Reintentar los POST es seguro: la
  * marcación es idempotente por `clockPunchId` y repetir la misma respuesta al aviso devuelve 200 con
@@ -36,26 +39,27 @@ import {
   type OverrunAnswer,
   type SessionStatus,
 } from "../../../modules/self-portal/domain/services/clock-status";
-import { fail, type AppError, type ErrorDetail } from "../../errors/app-error";
-import type { ErrorKey } from "../../errors/error-catalog";
 import { childLogger } from "../../logger/logger";
-import { rootLogger } from "../services/winston-logger";
 import {
-  fetchOnce,
-  isRetryableStatus,
-  safeJson,
-  UpstreamError,
-  withTransientRetry,
-} from "./internal-http";
+  ACTOR_MISMATCH,
+  booleanOf,
+  broken,
+  callTimeInternal,
+  DATE_PATTERN,
+  instantOf,
+  nonNegativeIntegerOf,
+  nullableInstantOf,
+  nullableOneOf,
+  nullableUuidOf,
+  objectOf,
+  oneOf,
+  uuidOf,
+  type MappedError,
+  type TimeInternalCall,
+} from "./time-internal-http";
 
 const log = childLogger("work-session-client");
-const SERVICE_SLUG = "self-service";
 const WORK_SESSIONS_PATH = "/api/v1/time/internal/work-sessions";
-
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-/** ISO 8601 con zona explícita (`Z` u offset): un instante sin zona sería ambiguo. */
-const INSTANT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
 
 const PUNCTUALITY_VALUES = new Set([
   "ON_TIME",
@@ -76,57 +80,7 @@ const CLOSE_REASONS = new Set([
 ]);
 const SESSION_STATUS_VALUES: ReadonlySet<string> = new Set(SESSION_STATUSES);
 
-/** Máximo de detalles de people que se propagan al usuario, y largo máximo de cada uno. */
-const MAX_PROPAGATED_DETAILS = 10;
-const MAX_DETAIL_LENGTH = 200;
-
 // ───────────────────────────── Validación estricta del contrato ─────────────────────────────
-
-/** Marca de contrato roto: se lanza dentro del parseo y se traduce a `UpstreamError` no retryable. */
-class ContractViolation extends Error {}
-
-const broken = (field: string): never => {
-  throw new ContractViolation(field);
-};
-
-type Json = Record<string, unknown>;
-
-const objectOf = (value: unknown, field: string): Json =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Json)
-    : broken(field);
-
-const uuidOf = (value: unknown, field: string): string =>
-  typeof value === "string" && UUID_PATTERN.test(value) ? value.toLowerCase() : broken(field);
-
-const nullableUuidOf = (value: unknown, field: string): string | null =>
-  value === null ? null : uuidOf(value, field);
-
-const instantOf = (value: unknown, field: string): Date => {
-  if (typeof value !== "string" || !INSTANT_PATTERN.test(value)) {
-    return broken(field);
-  }
-  const instant = new Date(value);
-  return Number.isNaN(instant.getTime()) ? broken(field) : instant;
-};
-
-const nullableInstantOf = (value: unknown, field: string): Date | null =>
-  value === null ? null : instantOf(value, field);
-
-const nonNegativeIntegerOf = (value: unknown, field: string): number =>
-  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : broken(field);
-
-const booleanOf = (value: unknown, field: string): boolean =>
-  typeof value === "boolean" ? value : broken(field);
-
-const oneOf = (value: unknown, allowed: ReadonlySet<string>, field: string): string =>
-  typeof value === "string" && allowed.has(value) ? value : broken(field);
-
-const nullableOneOf = (
-  value: unknown,
-  allowed: ReadonlySet<string>,
-  field: string,
-): string | null => (value === null ? null : oneOf(value, allowed, field));
 
 const sessionStatusOf = (value: unknown, field: string): SessionStatus =>
   oneOf(value, SESSION_STATUS_VALUES, field) as SessionStatus;
@@ -199,16 +153,6 @@ export const parseOverrunAnswer = (raw: unknown, sessionId: string): OverrunAnsw
 
 // ───────────────────────────── Traducción de errores de people ─────────────────────────────
 
-interface MappedError {
-  /** Status con el que people debe acompañar el código; otro status es un contrato roto. */
-  readonly status: number;
-  readonly key: ErrorKey;
-  /** `true` si los `errors` de people se propagan (saneados) al usuario. */
-  readonly propagateDetails: boolean;
-}
-
-const ACTOR_MISMATCH: MappedError = { status: 403, key: "FORBIDDEN", propagateDetails: false };
-
 const PUNCH_ERRORS: Readonly<Record<string, MappedError>> = {
   TIMCLK0005: { status: 409, key: "CLOCK_PUNCH_INVALID_TRANSITION", propagateDetails: true },
   TIMCLK0010: { status: 409, key: "CLOCK_PUNCH_INVALID_TRANSITION", propagateDetails: true },
@@ -227,50 +171,9 @@ const OVERRUN_ANSWER_ERRORS: Readonly<Record<string, MappedError>> = {
   TIMCLK0012: ACTOR_MISMATCH,
 };
 
-/** `errors` de people reducidos a pares `{ field, issue }` de texto, acotados en número y largo. */
-const sanitizeDetails = (raw: unknown): ErrorDetail[] => {
-  if (!Array.isArray(raw)) {
-    return [];
-  }
-  const details: ErrorDetail[] = [];
-  for (const item of raw) {
-    if (details.length >= MAX_PROPAGATED_DETAILS) {
-      break;
-    }
-    if (typeof item !== "object" || item === null) {
-      continue;
-    }
-    const { field, issue } = item as Json;
-    if (
-      typeof field === "string" &&
-      typeof issue === "string" &&
-      field.length > 0 &&
-      field.length <= MAX_DETAIL_LENGTH &&
-      issue.length <= MAX_DETAIL_LENGTH
-    ) {
-      details.push({ field, issue });
-    }
-  }
-  return details;
-};
-
 // ───────────────────────────── Cliente ─────────────────────────────
 
-/** Resultado de un intento: éxito, o un error de people ya traducido (no se reintenta). */
-type Attempt<T> =
-  | { readonly kind: "ok"; readonly value: T }
-  | { readonly kind: "mapped"; readonly error: AppError };
-
-interface CallSpec<T> {
-  readonly step: string;
-  readonly method: "GET" | "POST";
-  readonly url: string;
-  readonly apiKey: string;
-  readonly caller: WorkSessionCaller;
-  readonly body?: unknown;
-  readonly errors: Readonly<Record<string, MappedError>>;
-  readonly parse: (data: unknown) => T;
-}
+type CallSpec<T> = Omit<TimeInternalCall<T>, "timeoutMs" | "log">;
 
 export class WorkSessionClient implements IWorkSessionClient {
   private readonly baseUrl: string;
@@ -334,68 +237,7 @@ export class WorkSessionClient implements IWorkSessionClient {
     });
   }
 
-  private async call<T>(spec: CallSpec<T>): Promise<T> {
-    let outcome: Attempt<T>;
-    try {
-      outcome = await withTransientRetry(rootLogger(), spec.step, () => this.attempt(spec));
-    } catch (error) {
-      log.error("people (time) no pudo atender la llamada de jornada.", {
-        step: spec.step,
-        status: error instanceof UpstreamError ? error.status : undefined,
-        reason: error instanceof UpstreamError ? error.message : undefined,
-      });
-      throw fail("SELF_UPSTREAM_UNAVAILABLE");
-    }
-    if (outcome.kind === "mapped") {
-      throw outcome.error;
-    }
-    return outcome.value;
-  }
-
-  private async attempt<T>(spec: CallSpec<T>): Promise<Attempt<T>> {
-    const headers: Record<string, string> = {
-      "x-service-name": SERVICE_SLUG,
-      "x-internal-api-key": spec.apiKey,
-      "x-tenant-id": spec.caller.tenantId,
-      "x-acting-user-id": spec.caller.actingUserId,
-    };
-    if (spec.body !== undefined) {
-      headers["content-type"] = "application/json";
-    }
-    const response = await fetchOnce({
-      url: spec.url,
-      method: spec.method,
-      headers,
-      body: spec.body === undefined ? undefined : JSON.stringify(spec.body),
-      timeoutMs: this.timeoutMs,
-    });
-    const body = (await safeJson(response)) as Json | null;
-
-    if (response.status === 200) {
-      if (body === null || !("data" in body)) {
-        throw new UpstreamError(`${spec.step}: 200 sin data.`, false, 200);
-      }
-      try {
-        return { kind: "ok", value: spec.parse(body.data) };
-      } catch (error) {
-        if (error instanceof ContractViolation) {
-          // No es transitorio y no se inventan datos: el campo, nunca el valor.
-          throw new UpstreamError(`${spec.step}: contrato roto en ${error.message}.`, false, 200);
-        }
-        throw error;
-      }
-    }
-
-    const code = typeof body?.code === "string" ? body.code : undefined;
-    const mapped = code === undefined ? undefined : spec.errors[code];
-    if (mapped !== undefined && mapped.status === response.status) {
-      const details = mapped.propagateDetails ? sanitizeDetails(body?.errors) : [];
-      return { kind: "mapped", error: fail(mapped.key, details) };
-    }
-    throw new UpstreamError(
-      `${spec.step}: people respondió ${String(response.status)}${code === undefined ? "" : ` (${code})`}.`,
-      isRetryableStatus(response.status),
-      response.status,
-    );
+  private call<T>(spec: CallSpec<T>): Promise<T> {
+    return callTimeInternal({ ...spec, timeoutMs: this.timeoutMs, log });
   }
 }

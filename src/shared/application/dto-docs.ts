@@ -24,6 +24,8 @@ export interface DocOptions {
   readonly description?: string;
   /** Objeto anidado: la clase DTO que lo describe (thunk, para evitar el orden de declaración). */
   readonly nested?: DtoClassRef;
+  /** Con `nested`: el campo es una LISTA de objetos de esa clase (`items: { $ref }`). */
+  readonly each?: boolean;
 }
 
 export const DEFINITIONS_REF_PREFIX = "#/definitions/";
@@ -33,13 +35,18 @@ export const Doc =
   (target: object, propertyKey: string | symbol): void => {
     const key = String(propertyKey);
     if (options.nested !== undefined) {
-      ValidateNested()(target, key);
+      ValidateNested({ each: options.each === true })(target, key);
     }
     const build = (source: Schema): Schema => {
+      const ref = (nested: DtoClassRef): Schema => ({
+        $ref: `${DEFINITIONS_REF_PREFIX}${nested().name}`,
+      });
       let schema: Schema =
         options.nested === undefined
           ? { ...source }
-          : { $ref: `${DEFINITIONS_REF_PREFIX}${options.nested().name}` };
+          : options.each === true
+            ? { type: "array", items: ref(options.nested) }
+            : ref(options.nested);
       if (options.format !== undefined) {
         schema = { ...schema, format: options.format };
       }

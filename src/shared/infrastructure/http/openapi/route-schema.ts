@@ -48,13 +48,20 @@ export interface RouteDocs {
   readonly headers?: DtoClass;
   readonly response: {
     readonly description: string;
-    /** DTO del `data` del envelope `ResponseDto<T>` (respuesta 200). */
+    /** Status de éxito (200 por defecto; 201 en las altas). */
+    readonly status?: 200 | 201;
+    /** DTO del `data` del envelope `ResponseDto<T>`. */
     readonly data?: DtoClass;
     /**
      * `data` es una LISTA cuyos ítems son de alguna de estas clases (varias → `anyOf`, p. ej. según la
      * query) y el envelope lleva `meta.total`. Excluyente con `data`.
      */
     readonly list?: readonly [DtoClass, ...DtoClass[]];
+    /**
+     * Con `list`: listado PAGINADO; `meta` lleva `page`, `pageSize`, `total` y `totalPages` (C2) en
+     * lugar de solo `total`.
+     */
+    readonly paginated?: boolean;
     /** Esquema de una respuesta 200 que NO usa el envelope (p. ej. el propio documento OpenAPI). */
     readonly raw?: JsonSchema;
   };
@@ -127,24 +134,41 @@ export const dtoSchema = (dto: DtoClass): JsonSchema => {
   return inlineRefs(schema, all, [dto.name]) as JsonSchema;
 };
 
-const successEnvelope = (data: JsonSchema, description: string, withTotal = false): JsonSchema => ({
+type MetaKind = "none" | "total" | "page";
+
+const META_SCHEMAS: Readonly<Record<Exclude<MetaKind, "none">, JsonSchema>> = {
+  total: {
+    type: "object",
+    required: ["total"],
+    properties: { total: { type: "integer", minimum: 0 } },
+  },
+  page: {
+    type: "object",
+    required: ["page", "pageSize", "total", "totalPages"],
+    properties: {
+      page: { type: "integer", minimum: 1 },
+      pageSize: { type: "integer", minimum: 1, maximum: 100 },
+      total: { type: "integer", minimum: 0 },
+      totalPages: { type: "integer", minimum: 0 },
+    },
+  },
+};
+
+const successEnvelope = (
+  data: JsonSchema,
+  description: string,
+  meta: MetaKind = "none",
+  status = 200,
+): JsonSchema => ({
   description,
   type: "object",
-  required: ["success", "statusCode", "message", "data", ...(withTotal ? ["meta"] : [])],
+  required: ["success", "statusCode", "message", "data", ...(meta === "none" ? [] : ["meta"])],
   properties: {
     success: { type: "boolean", enum: [true] },
-    statusCode: { type: "integer", enum: [200] },
+    statusCode: { type: "integer", enum: [status] },
     message: { type: "string" },
     data,
-    ...(withTotal
-      ? {
-          meta: {
-            type: "object",
-            required: ["total"],
-            properties: { total: { type: "integer", minimum: 0 } },
-          },
-        }
-      : {}),
+    ...(meta === "none" ? {} : { meta: META_SCHEMAS[meta] }),
   },
 });
 
@@ -187,16 +211,29 @@ export const routeSchema = (docs: RouteDocs): DocumentedRouteSchema => {
   if (docs.response.data !== undefined && docs.response.list !== undefined) {
     throw new Error(`OpenAPI: ${docs.operationId} declara a la vez data y list.`);
   }
+  const okStatus = docs.response.status ?? 200;
+  if (docs.response.paginated === true && docs.response.list === undefined) {
+    throw new Error(`OpenAPI: ${docs.operationId} declara paginated sin list.`);
+  }
   if (docs.response.data !== undefined) {
-    response["200"] = successEnvelope(dtoSchema(docs.response.data), docs.response.description);
+    response[String(okStatus)] = successEnvelope(
+      dtoSchema(docs.response.data),
+      docs.response.description,
+      "none",
+      okStatus,
+    );
   } else if (docs.response.list !== undefined) {
-    response["200"] = successEnvelope(
+    response[String(okStatus)] = successEnvelope(
       listSchema(docs.response.list),
       docs.response.description,
-      true,
+      docs.response.paginated === true ? "page" : "total",
+      okStatus,
     );
   } else {
-    response["200"] = { description: docs.response.description, ...(docs.response.raw ?? {}) };
+    response[String(okStatus)] = {
+      description: docs.response.description,
+      ...(docs.response.raw ?? {}),
+    };
   }
   for (const [status, keys] of [...byStatus.entries()].sort(([a], [b]) => a - b)) {
     response[String(status)] = errorEnvelope(status, keys);

@@ -11,6 +11,8 @@
  *   - el documento publicado (`GET /docs/openapi.json`) no contiene operaciones `x-internal` y sí
  *     las rutas documentadas, y las respuestas reales de `clock-status` (con jornada y aviso),
  *     `clock-punch` y `shift-overruns/:sessionId/answer` tienen la forma documentada;
+ *   - las respuestas reales de las cinco rutas de horas extra excepcionales (Lote 4.4B2) tienen la
+ *     forma documentada (201 en el alta, `meta` paginada en los listados);
  *   - regresión: con el validador de Fastify desactivado, un cuerpo inválido sigue dando 422.
  */
 import { after, before, test } from "node:test";
@@ -24,11 +26,19 @@ import {
   API,
   assignmentJson,
   buildHarness,
+  createdData,
   okData,
+  pagedData,
   vet,
   workSessionJson,
   type Harness,
 } from "../support/http-harness";
+import {
+  balanceJson,
+  ownItemJson,
+  teamItemJson,
+  teamValidationJson,
+} from "../support/overtime-fixtures";
 import { routeCatalogOf } from "../../src/shared/infrastructure/http/openapi/openapi";
 import {
   INTERNAL_PERMISSION,
@@ -58,7 +68,7 @@ before(async () => {
   h.upstream.principals.set(TOKEN, {
     userId: USER,
     tenantId: TENANT,
-    permissions: ["self_service:read", "self_service:punch"],
+    permissions: ["self_service:read", "self_service:punch", "team:read"],
   });
   h.upstream.employees.set(TOKEN, { employeeId: EMPLOYEE, userId: USER, fullName: "Ana Pérez" });
   const noc = assignmentJson("2026-11-22", "19:00", "07:00", "Guardia NOC Nocturna 12h", {
@@ -231,10 +241,10 @@ const assertShape = (value: unknown, rawSchema: Json, where: string): void => {
   }
 };
 
-/** Esquema 200 documentado de una ruta del catálogo. */
-const okSchemaOf = (method: string, url: string): Json => {
+/** Esquema de éxito documentado (200 por defecto) de una ruta del catálogo. */
+const okSchemaOf = (method: string, url: string, status = "200"): Json => {
   const route = routeCatalogOf(h.app).find((r) => r.method === method && r.url === url);
-  return (route?.schema?.response as Record<string, Json>)["200"];
+  return (route?.schema?.response as Record<string, Json>)[status];
 };
 
 test("las respuestas reales de clock-punch y del aviso de fin de turno tienen la forma documentada", async () => {
@@ -302,6 +312,133 @@ test("la respuesta real de clock-status tiene exactamente la forma documentada",
   );
   const okSchema = (route?.schema?.response as Record<string, Json>)["200"];
   assertShape(res.json(), okSchema, "clock-status");
+});
+
+test("las respuestas reales de las rutas de horas extra excepcionales tienen la forma documentada", async () => {
+  const requestId = randomUUID();
+  h.upstream.overtime.submit = createdData({
+    id: requestId,
+    status: "PENDING_SUPERVISOR_VALIDATION",
+    requestedMinutes: 120,
+    exceededLimits: ["DAILY"],
+    supervisorValidation: null,
+  });
+  h.upstream.overtime.ownRequests = pagedData([
+    ownItemJson(),
+    ownItemJson({
+      status: "APPROVED",
+      approvedMinutes: 120,
+      approvedBreakdown: [{ category: "NOCTURNA_80", minutes: 120 }],
+    }),
+  ]);
+  h.upstream.overtime.balance = okData(
+    balanceJson({ monthly: balanceJson().daily as Record<string, unknown> }),
+  );
+  h.upstream.overtime.teamList = pagedData([
+    teamItemJson({ supervisorValidation: teamValidationJson() }),
+  ]);
+  h.upstream.overtime.validation = (id) =>
+    okData({ id, status: "PENDING_HR_APPROVAL", supervisorValidation: teamValidationJson() });
+
+  const auth = { authorization: `Bearer ${TOKEN}` };
+  const json = { ...auth, "content-type": "application/json" };
+  const submit = await h.app.inject({
+    method: "POST",
+    url: `${API}/me/overtime-exceptions`,
+    headers: json,
+    payload: {
+      startAt: "2026-11-22T18:00:00-04:00",
+      endAt: "2026-11-22T20:00:00-04:00",
+      justification: "Cierre del incidente fuera de turno.",
+    },
+  });
+  assert.equal(submit.statusCode, 201);
+  assertShape(
+    submit.json(),
+    okSchemaOf("POST", `${API}/me/overtime-exceptions`, "201"),
+    "overtime-exceptions",
+  );
+
+  const cases: [string, string][] = [
+    [`${API}/me/overtime-requests`, `${API}/me/overtime-requests`],
+    [`${API}/me/overtime-balance`, `${API}/me/overtime-balance`],
+    [`${API}/team/overtime-exceptions`, `${API}/team/overtime-exceptions`],
+  ];
+  for (const [url, route] of cases) {
+    const res = await h.app.inject({ method: "GET", url, headers: auth });
+    assert.equal(res.statusCode, 200, url);
+    const body = res.json() as { data: unknown };
+    assertShape(body, okSchemaOf("GET", route), route);
+    if (Array.isArray(body.data)) {
+      const listSchema = (okSchemaOf("GET", route).properties as Record<string, Json>).data;
+      for (const item of body.data) {
+        assertShape(item, listSchema.items as Json, `${route}[]`);
+      }
+    }
+  }
+
+  // approvedBreakdown (D10): lista nullable de { category, minutes } documentada y real coinciden.
+  const own = await h.app.inject({
+    method: "GET",
+    url: `${API}/me/overtime-requests`,
+    headers: auth,
+  });
+  const itemSchema = (
+    (okSchemaOf("GET", `${API}/me/overtime-requests`).properties as Record<string, Json>).data
+      .items as Json
+  ).properties as Record<string, Json>;
+  const breakdownSchema = itemSchema.approvedBreakdown;
+  assert.ok(Array.isArray(breakdownSchema.anyOf), "approvedBreakdown debe documentarse nullable");
+  const arraySchema = (breakdownSchema.anyOf as Json[]).find((member) => member.type === "array");
+  assert.ok(arraySchema !== undefined, "approvedBreakdown debe documentarse como lista");
+  const approvedItem = (own.json() as { data: Record<string, unknown>[] }).data[1];
+  const breakdown = approvedItem.approvedBreakdown as Record<string, unknown>[];
+  assert.equal(breakdown.length, 1);
+  assertShape(breakdown[0], arraySchema.items as Json, "approvedBreakdown[]");
+  assert.equal((own.json() as { data: Record<string, unknown>[] }).data[0].approvedBreakdown, null);
+
+  const validation = await h.app.inject({
+    method: "POST",
+    url: `${API}/team/overtime-exceptions/${requestId}/validation`,
+    headers: json,
+    payload: { result: "CONFIRMED", comment: "Correcto." },
+  });
+  assert.equal(validation.statusCode, 200);
+  assertShape(
+    validation.json(),
+    okSchemaOf("POST", `${API}/team/overtime-exceptions/:id/validation`),
+    "overtime-validation",
+  );
+});
+
+test("el documento declara el 201 del alta y los códigos SSVOVT de horas extra", async () => {
+  const document = (
+    await h.app.inject({ method: "GET", url: `${API}/docs/openapi.json` })
+  ).json() as { paths: Record<string, Record<string, Json>> };
+  const codesOf = (operation: Json, status: string): unknown =>
+    (
+      (
+        (
+          (((operation.responses as Json)[status] as Json).content as Json)[
+            "application/json"
+          ] as Json
+        ).schema as Json
+      ).properties as Json
+    ).code;
+  const submit = document.paths[`${API}/me/overtime-exceptions`]?.post as Json;
+  const responses = submit.responses as Json;
+  assert.ok(responses["201"] !== undefined && responses["200"] === undefined, "alta = 201");
+  assert.deepEqual((codesOf(submit, "409") as Json).enum, ["SSVOVT0006"]);
+  assert.deepEqual((codesOf(submit, "422") as Json).enum, [
+    "SSVCOM0001",
+    "SSVOVT0001",
+    "SSVOVT0008",
+    "SSVOVT0011",
+  ]);
+  const validation = document.paths[`${API}/team/overtime-exceptions/{id}/validation`]
+    ?.post as Json;
+  assert.deepEqual((codesOf(validation, "403") as Json).enum, ["SSVCOM0003", "SSVOVT0010"]);
+  assert.deepEqual((codesOf(validation, "409") as Json).enum, ["SSVOVT0009"]);
 });
 
 test("regresión: con el validador de Fastify desactivado, un cuerpo inválido da 422 (no 400)", async () => {

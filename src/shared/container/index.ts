@@ -17,6 +17,7 @@ import { createRedisClient } from "../infrastructure/cache/redis-client";
 import { AbsencesClient } from "../infrastructure/http/absences-client";
 import { DocumentsClient } from "../infrastructure/http/documents-client";
 import { IdentityClient } from "../infrastructure/http/identity-client";
+import { OvertimeClient } from "../infrastructure/http/overtime-client";
 import { PayrollClient } from "../infrastructure/http/payroll-client";
 import { PeopleClient } from "../infrastructure/http/people-client";
 import { PeopleInternalClient } from "../infrastructure/http/people-internal-client";
@@ -67,7 +68,9 @@ export const registerIdentityClient = (
  *
  * `people` (pass-through) reenvía el token del usuario (sin clave); `payroll`/`absences`/`time`/
  * `documents` son de confianza per-pair, cada uno con SU clave dedicada. `WorkSessionClient` (jornada
- * de time, Lote 4.4B1) lleva DOS: la de lectura de time en el GET y la de escritura en los POST (C12). Todos comparten el timeout de
+ * de time, Lote 4.4B1) lleva DOS: la de lectura de time en el GET y la de escritura en los POST (C12);
+ * `OvertimeClient` (horas extra excepcionales, Lote 4.4B2) reutiliza esa misma pareja con la misma
+ * regla (lecturas con la de lectura, las dos escrituras con la de escritura). Todos comparten el timeout de
  * upstream (en `documents`, hasta recibir las cabeceras: el cuerpo fluye en stream).
  *
  * `PeopleInternalClient` es el canal trusted-service hacia people (`/api/v1/people/internal/*`:
@@ -102,6 +105,15 @@ export const registerOutboundClients = (secrets: HttpSecrets): void => {
   container.registerInstance(
     TOKENS.WorkSessionClient,
     new WorkSessionClient(
+      env.TIME_INTERNAL_URL,
+      secrets.timeReadKey,
+      secrets.timeWriteKey,
+      env.UPSTREAM_TIMEOUT_MS,
+    ),
+  );
+  container.registerInstance(
+    TOKENS.OvertimeClient,
+    new OvertimeClient(
       env.TIME_INTERNAL_URL,
       secrets.timeReadKey,
       secrets.timeWriteKey,

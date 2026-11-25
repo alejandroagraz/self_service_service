@@ -4,11 +4,12 @@
  *
  *   - Un servidor HTTP local (`node:http`) hace de identity (`/sessions/verify`), de people
  *     (`/employees/me`), de time (`/time/internal/active-shift` y la jornada consolidada
- *     `/time/internal/work-sessions/*`, Lote 4.4B1), de payroll
+ *     `/time/internal/work-sessions/*`, Lote 4.4B1, y las horas extra excepcionales
+ *     `/time/internal/overtime-*` y `/time/internal/team/overtime-exceptions*`, Lote 4.4B2), de payroll
  *     (`/payroll/internal/payslips`), de absences (`/absences/internal/leave-balance`,
  *     `employee-month-absences` y `employee-requests`) y de documents
  *     (`/documents/internal/:id/content`). Los clientes REALES (`IdentityClient`, `PeopleClient`,
- *     `TimeClient`, `WorkSessionClient`, `PayrollClient`, `AbsencesClient`, `DocumentsClient`) le
+ *     `TimeClient`, `WorkSessionClient`, `OvertimeClient`, `PayrollClient`, `AbsencesClient`, `DocumentsClient`) le
  *     hablan por red, así que también se prueban su parseo y su mapeo de errores, sin depender de los
  *     servicios reales (que otros agentes están ampliando).
  *   - La Unidad de Trabajo es en memoria y respeta el aislamiento por tenant (el RLS real lo cubre
@@ -42,6 +43,7 @@ import type { IClock } from "../../src/shared/domain/services/clock.interface";
 import { AbsencesClient } from "../../src/shared/infrastructure/http/absences-client";
 import { DocumentsClient } from "../../src/shared/infrastructure/http/documents-client";
 import { IdentityClient } from "../../src/shared/infrastructure/http/identity-client";
+import { OvertimeClient } from "../../src/shared/infrastructure/http/overtime-client";
 import { PayrollClient } from "../../src/shared/infrastructure/http/payroll-client";
 import { PeopleClient } from "../../src/shared/infrastructure/http/people-client";
 import { PeopleInternalClient } from "../../src/shared/infrastructure/http/people-internal-client";
@@ -237,6 +239,20 @@ export interface UpstreamState {
     UpstreamResponse | ((sessionId: string, body: Record<string, unknown>) => UpstreamResponse);
   /** Peticiones recibidas en `work-sessions/*` (cabeceras de confianza, query y cuerpo). */
   workSessionCalls: WorkSessionCall[];
+  /**
+   * Respuestas de las rutas internas de horas extra excepcionales (Lote 4.4B2). `validation` puede ser
+   * una función del id de la ruta (p. ej. para simular una solicitud ajena o inexistente).
+   */
+  overtime: {
+    submit: UpstreamResponse;
+    ownRequests: UpstreamResponse;
+    balance: UpstreamResponse;
+    teamList: UpstreamResponse;
+    validation:
+      UpstreamResponse | ((requestId: string, body: Record<string, unknown>) => UpstreamResponse);
+  };
+  /** Peticiones recibidas en las rutas de horas extra (cabeceras de confianza, query y cuerpo). */
+  overtimeCalls: WorkSessionCall[];
   /** TODAS las peticiones recibidas por el doble (método, ruta y clave interna presentada). */
   allCalls: { method: string; path: string; apiKey: string | undefined }[];
   /** employeeId → filas de `/payroll/internal/payslips` (ausente → lista vacía). */
@@ -301,6 +317,14 @@ const headerOf = (req: IncomingMessage, name: string): string | undefined => {
 
 const DOCUMENT_CONTENT_PATH = /^\/api\/v1\/documents\/internal\/([^/]+)\/content$/;
 const WORK_SESSIONS_PREFIX = "/api/v1/time/internal/work-sessions";
+const OVERTIME_PATHS = [
+  "/api/v1/time/internal/overtime-exceptions",
+  "/api/v1/time/internal/overtime-requests",
+  "/api/v1/time/internal/overtime-balance",
+  "/api/v1/time/internal/team/overtime-exceptions",
+];
+const TEAM_VALIDATION_PATH =
+  /^\/api\/v1\/time\/internal\/team\/overtime-exceptions\/([^/]+)\/validation$/;
 const OVERRUN_ANSWER_PATH = /^\/api\/v1\/time\/internal\/work-sessions\/([^/]+)\/overrun-answer$/;
 
 const send = (res: ServerResponse, status: number, body: unknown): void => {
@@ -311,6 +335,67 @@ const send = (res: ServerResponse, status: number, body: unknown): void => {
 const bearer = (req: IncomingMessage): string | null => {
   const header = req.headers.authorization;
   return typeof header === "string" && header.startsWith("Bearer ") ? header.slice(7) : null;
+};
+
+const trustedCallOf = (
+  req: IncomingMessage,
+  url: URL,
+  body: Record<string, unknown> | null,
+): WorkSessionCall => ({
+  method: req.method ?? "GET",
+  path: url.pathname,
+  query: Object.fromEntries(url.searchParams.entries()),
+  body,
+  tenantId: headerOf(req, "x-tenant-id"),
+  serviceName: headerOf(req, "x-service-name"),
+  apiKey: headerOf(req, "x-internal-api-key"),
+  actingUserId: headerOf(req, "x-acting-user-id"),
+  authorization: headerOf(req, "authorization"),
+});
+
+const parseBody = (rawBody: string): Record<string, unknown> | null => {
+  try {
+    return rawBody.length === 0 ? null : (JSON.parse(rawBody) as Record<string, unknown>);
+  } catch {
+    return null;
+  }
+};
+
+const isOvertimePath = (pathname: string): boolean =>
+  OVERTIME_PATHS.includes(pathname) || TEAM_VALIDATION_PATH.test(pathname);
+
+const handleOvertime = (
+  state: UpstreamState,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  body: Record<string, unknown> | null,
+): void => {
+  state.overtimeCalls.push(trustedCallOf(req, url, body));
+  const { overtime } = state;
+  const route = `${req.method ?? "GET"} ${url.pathname}`;
+  const validationMatch = TEAM_VALIDATION_PATH.exec(url.pathname);
+  let response: UpstreamResponse | undefined;
+  if (route === `POST ${OVERTIME_PATHS[0]}`) {
+    response = overtime.submit;
+  } else if (route === `GET ${OVERTIME_PATHS[1]}`) {
+    response = overtime.ownRequests;
+  } else if (route === `GET ${OVERTIME_PATHS[2]}`) {
+    response = overtime.balance;
+  } else if (route === `GET ${OVERTIME_PATHS[3]}`) {
+    response = overtime.teamList;
+  } else if (req.method === "POST" && validationMatch !== null) {
+    const requestId = decodeURIComponent(validationMatch[1]);
+    response =
+      typeof overtime.validation === "function"
+        ? overtime.validation(requestId, body ?? {})
+        : overtime.validation;
+  }
+  if (response === undefined) {
+    send(res, 404, { success: false, code: "NOTFOUND", data: null });
+    return;
+  }
+  send(res, response.status, response.body);
 };
 
 const handleWorkSessions = (
@@ -366,6 +451,10 @@ const handle = (
     path: url.pathname,
     apiKey: headerOf(req, "x-internal-api-key"),
   });
+  if (isOvertimePath(url.pathname)) {
+    handleOvertime(state, req, res, url, parseBody(rawBody));
+    return;
+  }
   if (url.pathname.startsWith(`${WORK_SESSIONS_PREFIX}/`)) {
     let body: Record<string, unknown> | null = null;
     try {
@@ -501,6 +590,11 @@ export interface Harness {
   close(): Promise<void>;
 }
 
+const UNAVAILABLE: UpstreamResponse = {
+  status: 503,
+  body: { success: false, code: "PPLCOM0004", data: null },
+};
+
 /** Una por fichero de test: el controller es `@singleton()` y captura los dobles al construirse. */
 export const buildHarness = async (): Promise<Harness> => {
   const upstream: UpstreamState = {
@@ -513,6 +607,14 @@ export const buildHarness = async (): Promise<Harness> => {
     currentSession: { status: 200, body: { success: true, statusCode: 200, data: null } },
     overrunAnswer: { status: 503, body: { success: false, code: "PPLCOM0004", data: null } },
     workSessionCalls: [],
+    overtime: {
+      submit: UNAVAILABLE,
+      ownRequests: UNAVAILABLE,
+      balance: UNAVAILABLE,
+      teamList: UNAVAILABLE,
+      validation: UNAVAILABLE,
+    },
+    overtimeCalls: [],
     allCalls: [],
     payslips: new Map(),
     payrollStatus: null,
@@ -564,6 +666,10 @@ export const buildHarness = async (): Promise<Harness> => {
   container.registerInstance(
     TOKENS.WorkSessionClient,
     new WorkSessionClient(baseUrl, key, TEST_TIME_WRITE_KEY, UPSTREAM_TIMEOUT_MS),
+  );
+  container.registerInstance(
+    TOKENS.OvertimeClient,
+    new OvertimeClient(baseUrl, key, TEST_TIME_WRITE_KEY, UPSTREAM_TIMEOUT_MS),
   );
   container.registerInstance(
     TOKENS.DocumentsClient,
@@ -658,6 +764,36 @@ export const workSessionJson = (
   postCloseCheckoutAt: null,
   ...overrides,
 });
+
+/** Envelope 201 de people (altas). */
+export const createdData = (data: unknown): UpstreamResponse => ({
+  status: 201,
+  body: { success: true, statusCode: 201, message: "creado", data },
+});
+
+/** Envelope paginado de people (`meta` C2). */
+export const pagedData = (
+  data: readonly unknown[],
+  meta: { page?: number; pageSize?: number; total?: number; totalPages?: number } = {},
+): UpstreamResponse => {
+  const pageSize = meta.pageSize ?? 20;
+  const total = meta.total ?? data.length;
+  return {
+    status: 200,
+    body: {
+      success: true,
+      statusCode: 200,
+      message: "ok",
+      data,
+      meta: {
+        page: meta.page ?? 1,
+        pageSize,
+        total,
+        totalPages: meta.totalPages ?? Math.max(1, Math.ceil(total / pageSize)),
+      },
+    },
+  };
+};
 
 export const okData = (data: unknown): UpstreamResponse => ({
   status: 200,

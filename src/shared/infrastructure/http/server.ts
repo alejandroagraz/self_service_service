@@ -30,6 +30,7 @@ import { loadHttpSecrets } from "../../config/http-secrets";
 import { registerIdentityClient, registerOutboundClients } from "../../container";
 import { childLogger } from "../../logger/logger";
 import { contextLogger } from "../services/winston-logger";
+import { registerOvertimePortalRoutes } from "../../../modules/self-portal/infrastructure/http/routes/overtime-portal.routes";
 import { registerSelfPortalRoutes } from "../../../modules/self-portal/infrastructure/http/routes/self-portal.routes";
 import { registerAuthentication } from "./middlewares/authentication.middleware";
 import { registerOpenapi, registerOpenapiDocumentRoute } from "./openapi/openapi";
@@ -144,6 +145,7 @@ export const buildHttpApp = async (options: HttpAppOptions = {}): Promise<Fastif
   await app.register(
     async (scope) => {
       registerSelfPortalRoutes(scope);
+      registerOvertimePortalRoutes(scope);
       registerOpenapiDocumentRoute(scope, openapi);
     },
     { prefix: API_PREFIX },

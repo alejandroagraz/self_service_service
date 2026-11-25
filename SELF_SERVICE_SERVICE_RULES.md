@@ -3,7 +3,8 @@
 BFF (Backend-for-Frontend) del **portal del colaborador**. Servicio hexagonal Fastify 5 + TypeORM.
 Schema PostgreSQL `self_service`, exchange RabbitMQ `self_service.events`, puerto `3012`, prefijo HTTP
 `/api/v1/self-service`. Permisos del catálogo de identity: `self_service:read` (lecturas),
-`self_service:punch` (fichaje).
+`self_service:punch` (fichaje y alta de horas extra excepcionales), `team:read` (vistas del
+supervisor).
 
 ## Rol: agregador, no CRUD
 
@@ -21,6 +22,11 @@ ruta `/internal/*` ni registra preHandler de "servicio de confianza" entrante.
 | GET | `/api/v1/self-service/me/payslips` | `self_service:read` | people + payroll |
 | POST | `/api/v1/self-service/me/clock-punch` | `self_service:punch` | people + time (`work-sessions/punches`) + clock_punches (propio) + Outbox |
 | POST | `/api/v1/self-service/me/shift-overruns/:sessionId/answer` | `self_service:punch` | people + time (`work-sessions/:id/overrun-answer`) |
+| POST | `/api/v1/self-service/me/overtime-exceptions` | `self_service:punch` | people + time (`overtime-exceptions`, escritura) |
+| GET | `/api/v1/self-service/me/overtime-requests` | `self_service:read` | people + time (`overtime-requests`) |
+| GET | `/api/v1/self-service/me/overtime-balance` | `self_service:read` | people + time (`overtime-balance`) |
+| GET | `/api/v1/self-service/team/overtime-exceptions` | `team:read` | time (`team/overtime-exceptions`) |
+| POST | `/api/v1/self-service/team/overtime-exceptions/:id/validation` | `team:read` | time (`team/overtime-exceptions/:id/validation`, escritura) |
 
 Ruta de red interna (sin autenticación, como `/metrics`; **Traefik debe excluirla** porque cuelga del
 prefijo público): `GET /api/v1/self-service/docs/openapi.json`, el OpenAPI publicado (DEC-16 = A).
@@ -92,6 +98,25 @@ el servidor HTTP (`http-secrets.ts`), 43 chars base64url, fail-fast. Nunca se es
 - Respuesta al aviso de fin de turno (`POST /me/shift-overruns/:sessionId/answer`, `{ answer:
   CONTINUE|END }`): `employeeId` resuelto en servidor; `TIMCLK0007` → 404 `SSVSHF0001`,
   `TIMCLK0008` → 409 `SSVSHF0002`. El BFF no escribe nada (people emite el evento).
+
+## Horas extra excepcionales (GAP-044, Lote 4.4B2)
+
+- Cliente `OvertimeClient` (`overtime-client.ts`) sobre el núcleo común `time-internal-http.ts`
+  (compartido con `WorkSessionClient`): mismas cabeceras y misma pareja de claves (escritura en los dos
+  POST, lectura en los tres GET), `X-Acting-User-Id` = userId del principal en todas.
+- Rutas `/me`: `employeeId` resuelto SIEMPRE vía people (`/employees/me`); un `employeeId`,
+  `supervisorId` o cualquier campo/parámetro no declarado → 422 `SSVCOM0001` sin llamar a people.
+  `GET /me/overtime-balance` no admite parámetros. Del supervisor, el empleado solo ve `result` y
+  `validatedAt` (D7: el BFF proyecta aunque people envíe más).
+- Rutas `/team`: ningún filtro de supervisor ni de empleado viaja; people deriva el supervisor del
+  actor (D11) y responde igual a una solicitud ajena o inexistente (403 `SSVOVT0010`). No se resuelve
+  el perfil. `team:read` autoriza también el POST de validación porque people verifica la relación.
+- Mapeo: `TIMOVT0001` → 422 `SSVOVT0001` (propaga `errors`), `TIMOVT0006` → 409 `SSVOVT0006`,
+  `TIMOVT0008` → 422 `SSVOVT0008`, `TIMOVT0009` → 409 `SSVOVT0009`, `TIMOVT0010` → 403 `SSVOVT0010`,
+  `TIMOVT0011` → 422 `SSVOVT0011`, `TIMCLK0012` → 403 `SSVCOM0003`; caída, código no previsto para la
+  ruta o contrato roto → 503 `SSVSLF0002`. Las dos escrituras NO se reintentan (no son idempotentes).
+- El alta responde 201; los listados, `meta` paginada `{ page, pageSize, total, totalPages }`.
+- Sin evidencias (4.5) ni avisos (4.4B3).
 
 ## OpenAPI (DEC-16 = A, modo transitorio)
 

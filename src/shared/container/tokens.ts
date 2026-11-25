@@ -32,6 +32,9 @@ export const TOKENS = {
   // Jornada consolidada de people (GAP-043, Lote 4.4B1): marcación síncrona, jornada vigente y
   // respuesta al aviso de fin de turno. Clave de escritura en los POST, de lectura en el GET.
   WorkSessionClient: Symbol.for("IWorkSessionClient"),
+  // Horas extra excepcionales de people (GAP-044, Lote 4.4B2): alta y lecturas del empleado, bandeja y
+  // validación del supervisor directo. Misma pareja de claves que `WorkSessionClient`.
+  OvertimeClient: Symbol.for("IOvertimeClient"),
   // Descarga de confianza del PDF de un recibo propio (GAP-012), clave per-caller ante documents.
   DocumentsClient: Symbol.for("IDocumentsClient"),
 } as const;

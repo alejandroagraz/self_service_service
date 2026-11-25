@@ -8,6 +8,11 @@
     "GET /api/v1/self-service/me/payslips/:payslipId/content",
     "GET /api/v1/self-service/me/absences",
     "POST /api/v1/self-service/me/shift-overruns/:sessionId/answer",
+    "POST /api/v1/self-service/me/overtime-exceptions",
+    "GET /api/v1/self-service/me/overtime-requests",
+    "GET /api/v1/self-service/me/overtime-balance",
+    "GET /api/v1/self-service/team/overtime-exceptions",
+    "POST /api/v1/self-service/team/overtime-exceptions/:id/validation",
     "GET /api/v1/self-service/docs/openapi.json"
   ]
 }
