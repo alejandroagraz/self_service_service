@@ -3,7 +3,7 @@
  *
  * Los esquemas se GENERAN de los DTO class-validator con `validationMetadatasToSchemas()` de
  * `class-validator-jsonschema` (el código es la fuente de verdad; nada se escribe a mano salvo el
- * envelope común `ResponseDto<T>`). Cada ruta documenta: `body`/`querystring`/`params`, `response`
+ * envelope común `ResponseDto<T>`). Cada ruta documenta: `body`/`querystring`/`params`/`headers`, `response`
  * (envelope de éxito + un envelope de error por código HTTP, con los `code` reales del catálogo),
  * `tags`, `operationId`, `summary`, `security` y la extensión `x-permission` (la clave real de
  * `requirePermission`, o `public` / `internal`). Las rutas internas o de servicio llevan además
@@ -44,6 +44,8 @@ export interface RouteDocs {
   readonly body?: DtoClass;
   readonly querystring?: DtoClass;
   readonly params?: DtoClass;
+  /** Cabeceras propias de la ruta (p. ej. `Idempotency-Key`); propiedades en minúsculas. */
+  readonly headers?: DtoClass;
   readonly response: {
     readonly description: string;
     /** DTO del `data` del envelope `ResponseDto<T>` (respuesta 200). */
@@ -212,6 +214,7 @@ export const routeSchema = (docs: RouteDocs): DocumentedRouteSchema => {
     ...(docs.body === undefined ? {} : { body: dtoSchema(docs.body) }),
     ...(docs.querystring === undefined ? {} : { querystring: dtoSchema(docs.querystring) }),
     ...(docs.params === undefined ? {} : { params: dtoSchema(docs.params) }),
+    ...(docs.headers === undefined ? {} : { headers: dtoSchema(docs.headers) }),
     response,
   };
 };

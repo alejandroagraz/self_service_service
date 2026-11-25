@@ -3,11 +3,12 @@
  * rutas, preHandlers, manejador de errores, OpenAPI) con dobles en los bordes:
  *
  *   - Un servidor HTTP local (`node:http`) hace de identity (`/sessions/verify`), de people
- *     (`/employees/me`), de time (`/time/internal/active-shift`), de payroll
+ *     (`/employees/me`), de time (`/time/internal/active-shift` y la jornada consolidada
+ *     `/time/internal/work-sessions/*`, Lote 4.4B1), de payroll
  *     (`/payroll/internal/payslips`), de absences (`/absences/internal/leave-balance`,
  *     `employee-month-absences` y `employee-requests`) y de documents
  *     (`/documents/internal/:id/content`). Los clientes REALES (`IdentityClient`, `PeopleClient`,
- *     `TimeClient`, `PayrollClient`, `AbsencesClient`, `DocumentsClient`) le
+ *     `TimeClient`, `WorkSessionClient`, `PayrollClient`, `AbsencesClient`, `DocumentsClient`) le
  *     hablan por red, así que también se prueban su parseo y su mapeo de errores, sin depender de los
  *     servicios reales (que otros agentes están ampliando).
  *   - La Unidad de Trabajo es en memoria y respeta el aislamiento por tenant (el RLS real lo cubre
@@ -46,12 +47,18 @@ import { PeopleClient } from "../../src/shared/infrastructure/http/people-client
 import { PeopleInternalClient } from "../../src/shared/infrastructure/http/people-internal-client";
 import { buildHttpApp } from "../../src/shared/infrastructure/http/server";
 import { TimeClient } from "../../src/shared/infrastructure/http/time-client";
+import { WorkSessionClient } from "../../src/shared/infrastructure/http/work-session-client";
 import { UuidV4IdGenerator } from "../../src/shared/infrastructure/services/uuid-v4-id-generator";
 import { rootLogger } from "../../src/shared/infrastructure/services/winston-logger";
 
 export const API = "/api/v1/self-service";
 /** Clave de relleno de los clientes de confianza (no es un secreto de ningún entorno). */
 export const TEST_SERVICE_KEY = "test-key-not-a-secret";
+/**
+ * Clave de relleno de ESCRITURA hacia time (Lote 4.4B1, C12), distinta de la de lectura: los tests
+ * comprueban que solo viaja en los POST de `work-sessions`.
+ */
+export const TEST_TIME_WRITE_KEY = "test-write-key-not-a-secret";
 const UPSTREAM_TIMEOUT_MS = 2_000;
 
 // ───────────────────────────── Reloj manual ─────────────────────────────
@@ -125,8 +132,21 @@ class InMemoryClockPunchRepository implements IClockPunchRepository {
       .sort((a, b) => a.punchedAt.getTime() - b.punchedAt.getTime() || a.id.localeCompare(b.id));
   }
 
-  async save(punch: ClockPunch): Promise<void> {
+  async findById(id: string): Promise<ClockPunch | null> {
+    return (
+      [...this.committed, ...this.staged].find(
+        (row) => row.tenantId === this.tenantId && row.punch.id === id,
+      )?.punch ?? null
+    );
+  }
+
+  /** `ON CONFLICT (id) DO NOTHING`: la PK es global (no por tenant), como en PostgreSQL. */
+  async insertIfAbsent(punch: ClockPunch): Promise<boolean> {
+    if ([...this.committed, ...this.staged].some((row) => row.punch.id === punch.id)) {
+      return false;
+    }
     this.staged.push({ tenantId: this.tenantId, punch });
+    return true;
   }
 }
 
@@ -208,6 +228,17 @@ export interface UpstreamState {
   activeShift: UpstreamResponse;
   /** Peticiones recibidas en `active-shift` (para verificar cabeceras y query). */
   activeShiftCalls: { employeeId: string | null; tenantId: string | undefined }[];
+  /** Respuesta de `POST /time/internal/work-sessions/punches` (función: según el cuerpo). */
+  punches: UpstreamResponse | ((body: Record<string, unknown>) => UpstreamResponse);
+  /** Respuesta de `GET /time/internal/work-sessions/current`. */
+  currentSession: UpstreamResponse;
+  /** Respuesta de `POST /time/internal/work-sessions/:id/overrun-answer`. */
+  overrunAnswer:
+    UpstreamResponse | ((sessionId: string, body: Record<string, unknown>) => UpstreamResponse);
+  /** Peticiones recibidas en `work-sessions/*` (cabeceras de confianza, query y cuerpo). */
+  workSessionCalls: WorkSessionCall[];
+  /** TODAS las peticiones recibidas por el doble (método, ruta y clave interna presentada). */
+  allCalls: { method: string; path: string; apiKey: string | undefined }[];
   /** employeeId → filas de `/payroll/internal/payslips` (ausente → lista vacía). */
   payslips: Map<string, readonly Record<string, unknown>[]>;
   /** Fuerza el status de `/payroll/internal/payslips` (p. ej. 503 = payroll caído). */
@@ -224,6 +255,18 @@ export interface UpstreamState {
   absenceRequests: UpstreamResponse;
   /** Peticiones recibidas en absences `employee-month-absences` y `employee-requests`. */
   absencesCalls: AbsencesCall[];
+}
+
+export interface WorkSessionCall {
+  readonly method: string;
+  readonly path: string;
+  readonly query: Readonly<Record<string, string>>;
+  readonly body: Record<string, unknown> | null;
+  readonly tenantId: string | undefined;
+  readonly serviceName: string | undefined;
+  readonly apiKey: string | undefined;
+  readonly actingUserId: string | undefined;
+  readonly authorization: string | undefined;
 }
 
 export interface AbsencesCall {
@@ -257,6 +300,8 @@ const headerOf = (req: IncomingMessage, name: string): string | undefined => {
 };
 
 const DOCUMENT_CONTENT_PATH = /^\/api\/v1\/documents\/internal\/([^/]+)\/content$/;
+const WORK_SESSIONS_PREFIX = "/api/v1/time/internal/work-sessions";
+const OVERRUN_ANSWER_PATH = /^\/api\/v1\/time\/internal\/work-sessions\/([^/]+)\/overrun-answer$/;
 
 const send = (res: ServerResponse, status: number, body: unknown): void => {
   res.writeHead(status, { "content-type": "application/json" });
@@ -268,8 +313,69 @@ const bearer = (req: IncomingMessage): string | null => {
   return typeof header === "string" && header.startsWith("Bearer ") ? header.slice(7) : null;
 };
 
-const handle = (state: UpstreamState, req: IncomingMessage, res: ServerResponse): void => {
+const handleWorkSessions = (
+  state: UpstreamState,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  body: Record<string, unknown> | null,
+): void => {
+  state.workSessionCalls.push({
+    method: req.method ?? "GET",
+    path: url.pathname,
+    query: Object.fromEntries(url.searchParams.entries()),
+    body,
+    tenantId: headerOf(req, "x-tenant-id"),
+    serviceName: headerOf(req, "x-service-name"),
+    apiKey: headerOf(req, "x-internal-api-key"),
+    actingUserId: headerOf(req, "x-acting-user-id"),
+    authorization: headerOf(req, "authorization"),
+  });
+  if (req.method === "POST" && url.pathname === `${WORK_SESSIONS_PREFIX}/punches`) {
+    const response =
+      typeof state.punches === "function" ? state.punches(body ?? {}) : state.punches;
+    send(res, response.status, response.body);
+    return;
+  }
+  if (req.method === "GET" && url.pathname === `${WORK_SESSIONS_PREFIX}/current`) {
+    send(res, state.currentSession.status, state.currentSession.body);
+    return;
+  }
+  const answerMatch = OVERRUN_ANSWER_PATH.exec(url.pathname);
+  if (req.method === "POST" && answerMatch !== null) {
+    const sessionId = decodeURIComponent(answerMatch[1]);
+    const response =
+      typeof state.overrunAnswer === "function"
+        ? state.overrunAnswer(sessionId, body ?? {})
+        : state.overrunAnswer;
+    send(res, response.status, response.body);
+    return;
+  }
+  send(res, 404, { success: false, code: "NOTFOUND", data: null });
+};
+
+const handle = (
+  state: UpstreamState,
+  req: IncomingMessage,
+  res: ServerResponse,
+  rawBody: string,
+): void => {
   const url = new URL(req.url ?? "/", "http://upstream.test");
+  state.allCalls.push({
+    method: req.method ?? "GET",
+    path: url.pathname,
+    apiKey: headerOf(req, "x-internal-api-key"),
+  });
+  if (url.pathname.startsWith(`${WORK_SESSIONS_PREFIX}/`)) {
+    let body: Record<string, unknown> | null = null;
+    try {
+      body = rawBody.length === 0 ? null : (JSON.parse(rawBody) as Record<string, unknown>);
+    } catch {
+      body = null;
+    }
+    handleWorkSessions(state, req, res, url, body);
+    return;
+  }
   if (url.pathname === "/api/v1/identity/sessions/verify") {
     const principal = state.principals.get(bearer(req) ?? "");
     if (principal === undefined) {
@@ -403,6 +509,11 @@ export const buildHarness = async (): Promise<Harness> => {
     peopleStatus: null,
     activeShift: { status: 200, body: { success: true, data: { shiftName: null } } },
     activeShiftCalls: [],
+    punches: { status: 503, body: { success: false, code: "PPLCOM0004", data: null } },
+    currentSession: { status: 200, body: { success: true, statusCode: 200, data: null } },
+    overrunAnswer: { status: 503, body: { success: false, code: "PPLCOM0004", data: null } },
+    workSessionCalls: [],
+    allCalls: [],
     payslips: new Map(),
     payrollStatus: null,
     payrollCalls: [],
@@ -413,7 +524,11 @@ export const buildHarness = async (): Promise<Harness> => {
     absencesCalls: [],
   };
   const server: Server = createServer((req, res) => {
-    handle(upstream, req, res);
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      handle(upstream, req, res, Buffer.concat(chunks).toString("utf8"));
+    });
   });
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", resolve);
@@ -446,6 +561,10 @@ export const buildHarness = async (): Promise<Harness> => {
     new AbsencesClient(baseUrl, key, UPSTREAM_TIMEOUT_MS),
   );
   container.registerInstance(TOKENS.TimeClient, new TimeClient(baseUrl, key, UPSTREAM_TIMEOUT_MS));
+  container.registerInstance(
+    TOKENS.WorkSessionClient,
+    new WorkSessionClient(baseUrl, key, TEST_TIME_WRITE_KEY, UPSTREAM_TIMEOUT_MS),
+  );
   container.registerInstance(
     TOKENS.DocumentsClient,
     new DocumentsClient(baseUrl, key, UPSTREAM_TIMEOUT_MS),
@@ -513,4 +632,51 @@ export const activeShiftOk = (
 ): UpstreamResponse => ({
   status: 200,
   body: { success: true, statusCode: 200, data: { shiftName, assignments, settings } },
+});
+
+/**
+ * `WorkSessionDto` del contrato 4.4B1 §3 (JSON, todos los campos presentes). Por defecto, una jornada
+ * `ACTIVE` sin turno ni aviso, con entrada a las 08:00 VET del 2026-11-23.
+ */
+export const workSessionJson = (
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  sessionId: randomUUID(),
+  status: "ACTIVE",
+  punctuality: "IN_PROGRESS",
+  workDate: "2026-11-23",
+  shiftAssignmentId: null,
+  scheduledStartAt: null,
+  scheduledEndAt: null,
+  clockInAt: vet("2026-11-23T08:00").toISOString(),
+  clockOutAt: null,
+  closeReason: null,
+  onBreak: false,
+  overrun: null,
+  overtimeRequestId: null,
+  unrecordedOvertimeMinutes: 0,
+  postCloseCheckoutAt: null,
+  ...overrides,
+});
+
+export const okData = (data: unknown): UpstreamResponse => ({
+  status: 200,
+  body: { success: true, statusCode: 200, message: "ok", data },
+});
+
+/** Envelope de error de people (C1) con su `code` y `errors`. */
+export const peopleError = (
+  status: number,
+  code: string,
+  errors: readonly { field: string; issue: string }[] = [],
+): UpstreamResponse => ({
+  status,
+  body: {
+    success: false,
+    statusCode: status,
+    code,
+    message: "error de people",
+    data: null,
+    errors,
+  },
 });

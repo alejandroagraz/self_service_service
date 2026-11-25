@@ -1,13 +1,14 @@
 import type { EntityManager } from "typeorm";
 
 import { ClockPunchModel } from "../../../../shared/infrastructure/database/models/clock-punch.model";
+import { SELF_SERVICE_SCHEMA } from "../../../../shared/infrastructure/database/schema";
 import type { ClockPunch } from "../../domain/entities/clock-punch.entity";
 import type { IClockPunchRepository } from "../../domain/repositories/clock-punch-repository.interface";
 import { ClockPunchInfraMapper } from "./clock-punch-infra.mapper";
 
 /**
  * Repositorio TypeORM de `clock_punches` (POR-TENANT, RLS: sin `tenant_id` manual). APPEND-ONLY:
- * `save` solo inserta. Recibe el `EntityManager` de la transacción de `withTenant`, de modo que sus
+ * `insertIfAbsent` solo inserta. Recibe el `EntityManager` de la transacción de `withTenant`, de modo que sus
  * consultas corren bajo el `app.tenant_id` fijado y la política RLS filtra sola.
  */
 export class TypeOrmClockPunchRepository implements IClockPunchRepository {
@@ -48,9 +49,26 @@ export class TypeOrmClockPunchRepository implements IClockPunchRepository {
     return models.map((model) => ClockPunchInfraMapper.toDomain(model));
   }
 
-  async save(punch: ClockPunch): Promise<void> {
-    // `insert` y no `save`: con PK asignada por la aplicación, `save` emitiría un SELECT previo. La
-    // tabla es append-only, así que no hay actualización que reconciliar.
-    await this.manager.insert(ClockPunchModel, ClockPunchInfraMapper.toModel(punch));
+  async findById(id: string): Promise<ClockPunch | null> {
+    const model = await this.manager.findOne(ClockPunchModel, { where: { id } });
+    return model === null ? null : ClockPunchInfraMapper.toDomain(model);
+  }
+
+  async insertIfAbsent(punch: ClockPunch): Promise<boolean> {
+    // SQL explícito para fijar el destino del conflicto en la PK (`ON CONFLICT (id) DO NOTHING`):
+    // `orIgnore()` de TypeORM omitiría el destino y absorbería en silencio cualquier otra unicidad.
+    // `DO NOTHING` solo necesita el privilegio INSERT (la tabla es append-only: sin UPDATE). La fila
+    // corre bajo el `app.tenant_id` de `withTenant` (RLS, `WITH CHECK` implícito del `USING`).
+    // `RETURNING id` devuelve la fila solo si se insertó.
+    const s = ClockPunchInfraMapper.toModel(punch);
+    const rows = (await this.manager.query(
+      `INSERT INTO "${SELF_SERVICE_SCHEMA}"."clock_punches"
+         ("id", "tenant_id", "employee_id", "user_id", "action", "note", "punched_at", "created_at")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT ("id") DO NOTHING
+       RETURNING "id"`,
+      [s.id, s.tenantId, s.employeeId, s.userId, s.action, s.note, s.punchedAt, s.createdAt],
+    )) as unknown[];
+    return rows.length === 1;
   }
 }

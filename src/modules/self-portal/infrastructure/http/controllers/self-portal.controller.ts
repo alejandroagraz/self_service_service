@@ -23,10 +23,14 @@ import {
 } from "../../../../../shared/infrastructure/http/query-params";
 import { validateDto } from "../../../../../shared/infrastructure/http/validate-dto";
 import {
+  ClockPunchHeadersDto,
   ClockPunchRequestDto,
   GreetCelebrationRequestDto,
   PayslipContentParamsDto,
+  ShiftOverrunAnswerParamsDto,
+  ShiftOverrunAnswerRequestDto,
 } from "../../../application/dtos/self-portal.dto";
+import { AnswerShiftOverrunUseCase } from "../../../application/use-cases/answer-shift-overrun.use-case";
 import { DownloadMyPayslipContentUseCase } from "../../../application/use-cases/download-my-payslip-content.use-case";
 import { GetMyClockStatusUseCase } from "../../../application/use-cases/get-my-clock-status.use-case";
 import { GetMyMonthAbsencesUseCase } from "../../../application/use-cases/get-my-month-absences.use-case";
@@ -52,6 +56,8 @@ const YEAR_PATTERN = /^\d{4}$/;
 const MIN_YEAR = 2000;
 const MAX_YEAR = 2100;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+/** Cabecera de idempotencia de `POST /me/clock-punch` (Fastify entrega las cabeceras en minúsculas). */
+const IDEMPOTENCY_KEY_HEADER = "idempotency-key";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** `true` si `AAAA-MM-DD` es una fecha de calendario real (rechaza 2026-02-31, etc.). */
@@ -109,17 +115,27 @@ export class SelfPortalController {
     @inject(GetMyClockStatusUseCase) private readonly getMyClockStatus: GetMyClockStatusUseCase,
     @inject(DownloadMyPayslipContentUseCase)
     private readonly downloadMyPayslipContent: DownloadMyPayslipContentUseCase,
+    @inject(AnswerShiftOverrunUseCase)
+    private readonly answerShiftOverrunUseCase: AnswerShiftOverrunUseCase,
   ) {}
 
   async profile(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
     const principal = principalOf(request);
-    const data = await this.getMyProfile.execute(principal.tenantId, bearerOf(request));
+    const data = await this.getMyProfile.execute(
+      principal.tenantId,
+      principal.userId,
+      bearerOf(request),
+    );
     return reply.status(200).send(ok(data, "Perfil del colaborador obtenido con éxito."));
   }
 
   async clockStatus(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
     const principal = principalOf(request);
-    const data = await this.getMyClockStatus.execute(principal.tenantId, bearerOf(request));
+    const data = await this.getMyClockStatus.execute(
+      principal.tenantId,
+      principal.userId,
+      bearerOf(request),
+    );
     return reply.status(200).send(ok(data, "Estado de jornada."));
   }
 
@@ -156,16 +172,37 @@ export class SelfPortalController {
 
   async punch(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
     const principal = principalOf(request);
+    // Solo la cabecera de idempotencia (repetida → lista → 422). Ausente → `{}`.
+    const rawKey = request.headers[IDEMPOTENCY_KEY_HEADER];
+    const headers = validateDto(
+      ClockPunchHeadersDto,
+      rawKey === undefined ? {} : { [IDEMPOTENCY_KEY_HEADER]: rawKey },
+    );
     const dto = validateDto(ClockPunchRequestDto, request.body);
-    const data = await this.punchClock.execute(
+    const data = await this.punchClock.execute({
+      tenantId: principal.tenantId,
+      userId: principal.userId,
+      userBearerToken: bearerOf(request),
+      action: dto.action,
+      note: dto.note,
+      idempotencyKey: headers[IDEMPOTENCY_KEY_HEADER]?.toLowerCase(),
+    });
+    // 200 (no 201): el FE desenvuelve un ResponseDto<ClockPunchResultDto> con statusCode 200.
+    return reply.status(200).send(ok(data, data.message));
+  }
+
+  async answerShiftOverrun(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
+    const principal = principalOf(request);
+    const { sessionId } = validateDto(ShiftOverrunAnswerParamsDto, request.params);
+    const dto = validateDto(ShiftOverrunAnswerRequestDto, request.body);
+    const data = await this.answerShiftOverrunUseCase.execute(
       principal.tenantId,
       principal.userId,
       bearerOf(request),
-      dto.action,
-      dto.note,
+      sessionId.toLowerCase(),
+      dto.answer,
     );
-    // 200 (no 201): el FE desenvuelve un ResponseDto<ClockPunchResultDto> con statusCode 200.
-    return reply.status(200).send(ok(data, data.message));
+    return reply.status(200).send(ok(data, "Respuesta al aviso de fin de turno registrada."));
   }
 
   async celebrations(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
@@ -210,7 +247,10 @@ export class SelfPortalController {
     const date = toOptionalString(query.date);
     if (celebrantEmployeeId === undefined || !UUID_PATTERN.test(celebrantEmployeeId)) {
       throw fail("VALIDATION_FAILED", [
-        { field: "celebrantEmployeeId", issue: "Se requiere un `celebrantEmployeeId` UUID válido." },
+        {
+          field: "celebrantEmployeeId",
+          issue: "Se requiere un `celebrantEmployeeId` UUID válido.",
+        },
       ]);
     }
     if (date === undefined || !DATE_PATTERN.test(date)) {

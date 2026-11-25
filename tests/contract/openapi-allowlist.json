@@ -7,6 +7,7 @@
     "POST /api/v1/self-service/me/clock-punch",
     "GET /api/v1/self-service/me/payslips/:payslipId/content",
     "GET /api/v1/self-service/me/absences",
+    "POST /api/v1/self-service/me/shift-overruns/:sessionId/answer",
     "GET /api/v1/self-service/docs/openapi.json"
   ]
 }

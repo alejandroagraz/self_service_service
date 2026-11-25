@@ -2,10 +2,10 @@
  * «Día operativo» de la jornada del empleado (GAP-003, DEC-06 = A). Dominio puro (rulebook §1): no
  * conoce TypeORM, Fastify ni el reloj del sistema; recibe `now` y los datos ya leídos.
  *
- * Es la FUENTE ÚNICA con la que `GET /me/clock-status`, `GET /me/profile` y `POST /me/clock-punch`
- * calculan el estado de jornada, de modo que el portal y el topbar no divergen. Sustituye a la
- * derivación por «última marcación histórica sin acotar», que dejaba bloqueado (409 `SSVCLK0002`)
- * a quien no marcó la salida el día anterior.
+ * Desde el Lote 4.4B1 (GAP-043) este módulo ya NO decide el estado de jornada ni valida marcaciones:
+ * la autoridad es la jornada consolidada de people (`work-sessions`, ver `clock-status.ts`). Solo
+ * resuelve QUÉ turno y QUÉ ventana mostrar en `GET /me/clock-status` a partir de las asignaciones de
+ * `active-shift` (ayer, hoy y mañana) y de los parámetros del tenant.
  *
  * Todo se razona con instantes UTC absolutos (`startAt`/`endAt` ya vienen en UTC desde people), así
  * que un turno que cruza la medianoche no necesita comparar fechas de calendario. Solo el día natural
@@ -17,46 +17,18 @@
  *   shiftEndAt = endAt
  *   abandonAt  = min(endAt + abandonAfterMinutes, opensAt del turno SIGUIENTE de la lista)
  * Intervalo semiabierto `[opensAt, abandonAt)`: con turnos encadenados el `abandonAt` de uno es
- * exactamente el `opensAt` del siguiente (corte limpio) y las ventanas nunca se solapan. El «turno
- * siguiente» es el siguiente por `startAt` dentro de las asignaciones recibidas (ayer, hoy y mañana).
+ * exactamente el `opensAt` del siguiente (corte limpio) y las ventanas nunca se solapan.
  *
- * ── Regla de la asignación VIGENTE (orden de prioridad; decisión del usuario 2026-11-23) ──────────
- * «Tener turno hoy» = alguna asignación con `workDate` igual al día civil VET de `now`. El día
- * natural rige ÚNICAMENTE si el empleado no tiene ningún turno asignado ese día.
- *   1. `SHIFT_WINDOW`: `now` cae dentro de la ventana `[opensAt, abandonAt)` de una asignación. Es
- *      la vigente aunque su `workDate` sea ayer (un NOC 19:00–07:00 sigue vigente a las 02:00).
- *   2. Hoy tiene turno pero `now` está fuera de toda ventana (antes de abrir o ya vencida). En los
- *      dos subcasos el estado es `NOT_STARTED` y NO cuenta ninguna marcación (`countFrom = null`):
- *      la de una ventana vencida queda huérfana hasta GAP-043 (Lote 4.4), pero ya no bloquea
- *      (01B GAP-003 §6). Por eso un `CHECK_OUT`/`BREAK` tardío da 409 `SSVCLK0002` y la salida
- *      olvidada la regulariza RRHH.
- *      a. `BEFORE_SHIFT_WINDOW`: vale la SIGUIENTE asignación cuya ventana aún no abrió dentro del
- *         horizonte (hoy más tarde o mañana); un `CHECK_IN` → 409 `SSVCLK0003` con
- *         `errors:[{field:"opensAt"}]`. Ej.: turno 08:00–16:00 hoy y mañana a las 08:00 → a las
- *         20:00, 409 con la apertura de mañana (07:00).
- *      b. `AFTER_SHIFT_WINDOW`: no hay ninguna siguiente en el horizonte → vale la última asignación
- *         de hoy, ya vencida (su `window`); un `CHECK_IN` → 409 `SSVCLK0003` con `errors: []`: no se
- *         conoce la próxima apertura.
- *   3. `NATURAL_DAY`: hoy no hay ninguna asignación → día natural VET de `now`, sin entrada
- *      anticipada ni umbral de abandono (`window = null`). Cuentan las marcaciones desde las 00:00
- *      VET o desde el `abandonAt` de la última ventana ya vencida si es posterior, para no mezclar
- *      marcaciones que pertenecen a esa ventana (p. ej. el NOC de ayer).
- * Consecuencia buscada: con una entrada sin cerrar en una ventana ya vencida, el estado de la ventana
- * nueva (o del día natural) es `NOT_STARTED` y el siguiente `CHECK_IN` dentro de ella no devuelve 409
- * `SSVCLK0002` (cierra el P0).
- *
- * ── Estado ─────────────────────────────────────────────────────────────────────────────────────
- * Se deriva de la ÚLTIMA marcación con `countFrom <= punchedAt <= now` (máquina de `clock-status.ts`,
- * cuyas transiciones no cambian); con `countFrom = null` (paso 2) es `NOT_STARTED`. `since` es el
- * instante de esa marcación (null si `NOT_STARTED`).
+ * ── Asignación que se muestra (orden de prioridad) ─────────────────────────────────────────────
+ *   0. `SESSION_SHIFT`: hay una jornada vigente en people con turno programado y una de las
+ *      asignaciones tiene exactamente sus instantes (`scheduledStartAt`/`scheduledEndAt`). Se muestra
+ *      esa, aunque `now` ya esté fuera de su ventana (p. ej. horas extra tras responder «Sí»).
+ *   1. `SHIFT_WINDOW`: `now` cae dentro de la ventana `[opensAt, abandonAt)` de una asignación.
+ *   2. Hoy (día civil VET) tiene turno pero `now` está fuera de toda ventana:
+ *      a. `BEFORE_SHIFT_WINDOW`: la SIGUIENTE asignación cuya ventana aún no abrió (hoy o mañana);
+ *      b. `AFTER_SHIFT_WINDOW`: si no hay ninguna siguiente, la última de hoy, ya vencida.
+ *   3. `NATURAL_DAY`: hoy no hay ninguna asignación → día natural VET de `now` (`window = null`).
  */
-import { fail } from "../../../../shared/errors/app-error";
-import {
-  assertTransition,
-  type ClockAction,
-  type ClockStatus,
-  statusFromLastPunch,
-} from "./clock-status";
 
 const MS_PER_MINUTE = 60_000;
 
@@ -109,41 +81,29 @@ export interface ShiftWindow {
 }
 
 export type OperationalPeriodKind =
-  "SHIFT_WINDOW" | "BEFORE_SHIFT_WINDOW" | "AFTER_SHIFT_WINDOW" | "NATURAL_DAY";
+  "SESSION_SHIFT" | "SHIFT_WINDOW" | "BEFORE_SHIFT_WINDOW" | "AFTER_SHIFT_WINDOW" | "NATURAL_DAY";
 
-/** Lo que se sabe del día operativo ANTES de leer las marcaciones. */
+/** Turno y ventana que se muestran en el portal (ver la cabecera). */
 export interface OperationalDayPlan {
   readonly now: Date;
   readonly kind: OperationalPeriodKind;
-  /** `workDate` de la asignación vigente, o la fecha civil VET de `now` en el día natural. */
+  /** `workDate` de la asignación elegida, o la fecha civil VET de `now` en el día natural. */
   readonly operationalDate: string;
-  /** Asignación vigente; `null` en el día natural. */
+  /** Asignación elegida; `null` en el día natural. */
   readonly assignment: ShiftAssignmentSlot | null;
-  /** Ventana de la asignación vigente; `null` en el día natural. */
+  /** Ventana de la asignación elegida; `null` en el día natural. */
   readonly window: ShiftWindow | null;
-  /**
-   * Primer instante (inclusive) cuyas marcaciones cuentan para el estado; el último es `now`.
-   * `null` fuera de toda ventana un día con turno (paso 2): no cuenta ninguna → `NOT_STARTED`.
-   */
-  readonly countFrom: Date | null;
-}
-
-/** Lo mínimo de una marcación que necesita el cálculo (`ClockPunch` lo cumple). */
-export interface PunchFact {
-  readonly action: ClockAction;
-  readonly punchedAt: Date;
-}
-
-export interface OperationalDay extends OperationalDayPlan {
-  readonly status: ClockStatus;
-  /** Instante de la marcación que fija el estado actual; `null` si `NOT_STARTED`. */
-  readonly since: Date | null;
 }
 
 export interface OperationalDayInput {
   readonly now: Date;
   readonly assignments: readonly ShiftAssignmentSlot[];
   readonly settings: AttendanceSettings;
+  /**
+   * Turno programado de la jornada vigente de people (`scheduledStartAt`/`scheduledEndAt`), si la
+   * hay y tiene turno. Ancla la asignación que se muestra (paso 0).
+   */
+  readonly sessionShift?: { readonly startAt: Date; readonly endAt: Date } | null;
 }
 
 interface ScheduledSlot {
@@ -157,12 +117,6 @@ const addMinutes = (instant: Date, minutes: number): Date =>
 /** Fecha civil (`AAAA-MM-DD`) de Venezuela del instante dado. */
 export const vetDateOf = (instant: Date): string =>
   addMinutes(instant, VET_UTC_OFFSET_MINUTES).toISOString().slice(0, 10);
-
-/** Instante UTC de las 00:00 VET de una fecha civil `AAAA-MM-DD`. */
-export const vetDayStart = (date: string): Date => {
-  const [year, month, day] = date.split("-").map(Number);
-  return addMinutes(new Date(Date.UTC(year, month - 1, day)), -VET_UTC_OFFSET_MINUTES);
-};
 
 /** Ventanas de todas las asignaciones, ordenadas por `startAt` (orden estable). */
 const scheduleOf = (
@@ -185,24 +139,40 @@ const scheduleOf = (
   });
 };
 
-/** Paso 1–3 de la regla de la asignación vigente (ver cabecera). No mira las marcaciones. */
+const planOf = (
+  now: Date,
+  kind: OperationalPeriodKind,
+  { assignment, window }: ScheduledSlot,
+): OperationalDayPlan => ({
+  now,
+  kind,
+  operationalDate: assignment.workDate,
+  assignment,
+  window,
+});
+
+/** Pasos 0–3 de la regla de la asignación que se muestra (ver la cabecera). */
 export const planOperationalDay = (input: OperationalDayInput): OperationalDayPlan => {
-  const { now } = input;
+  const { now, sessionShift } = input;
   const nowMs = now.getTime();
   const schedule = scheduleOf(input.assignments, input.settings);
+
+  if (sessionShift !== undefined && sessionShift !== null) {
+    const anchored = schedule.find(
+      ({ assignment }) =>
+        assignment.startAt.getTime() === sessionShift.startAt.getTime() &&
+        assignment.endAt.getTime() === sessionShift.endAt.getTime(),
+    );
+    if (anchored !== undefined) {
+      return planOf(now, "SESSION_SHIFT", anchored);
+    }
+  }
 
   const active = schedule.find(
     ({ window }) => window.opensAt.getTime() <= nowMs && nowMs < window.abandonAt.getTime(),
   );
   if (active !== undefined) {
-    return {
-      now,
-      kind: "SHIFT_WINDOW",
-      operationalDate: active.assignment.workDate,
-      assignment: active.assignment,
-      window: active.window,
-      countFrom: active.window.opensAt,
-    };
+    return planOf(now, "SHIFT_WINDOW", active);
   }
 
   const today = vetDateOf(now);
@@ -211,93 +181,18 @@ export const planOperationalDay = (input: OperationalDayInput): OperationalDayPl
     // Paso 2a: la siguiente asignación cuya ventana aún no abrió (hoy más tarde o mañana).
     const next = schedule.find(({ window }) => nowMs < window.opensAt.getTime());
     if (next !== undefined) {
-      return {
-        now,
-        kind: "BEFORE_SHIFT_WINDOW",
-        operationalDate: next.assignment.workDate,
-        assignment: next.assignment,
-        window: next.window,
-        countFrom: null,
-      };
+      return planOf(now, "BEFORE_SHIFT_WINDOW", next);
     }
     // Paso 2b: ninguna siguiente en el horizonte → la última de hoy, ya vencida.
-    const last = todays[todays.length - 1];
-    return {
-      now,
-      kind: "AFTER_SHIFT_WINDOW",
-      operationalDate: last.assignment.workDate,
-      assignment: last.assignment,
-      window: last.window,
-      countFrom: null,
-    };
+    return planOf(now, "AFTER_SHIFT_WINDOW", todays[todays.length - 1]);
   }
 
-  // Paso 3, día natural (hoy sin turno): desde las 00:00 VET o desde el fin de la última ventana ya
-  // vencida si es posterior.
-  let countFromMs = vetDayStart(today).getTime();
-  for (const { window } of schedule) {
-    const abandonMs = window.abandonAt.getTime();
-    if (abandonMs <= nowMs && abandonMs > countFromMs) {
-      countFromMs = abandonMs;
-    }
-  }
+  // Paso 3: día natural (hoy sin turno).
   return {
     now,
     kind: "NATURAL_DAY",
     operationalDate: today,
     assignment: null,
     window: null,
-    countFrom: new Date(countFromMs),
   };
-};
-
-/**
- * Día operativo completo: el plan más el estado derivado SOLO de las marcaciones del periodo
- * vigente (`countFrom <= punchedAt <= now`). Acepta un superconjunto de marcaciones: las de fuera
- * del periodo se ignoran. Con dos marcaciones en el mismo instante gana la última de la lista.
- */
-export const resolveOperationalDay = (
-  input: OperationalDayInput & { readonly punches: readonly PunchFact[] },
-): OperationalDay => {
-  const plan = planOperationalDay(input);
-  const nowMs = plan.now.getTime();
-  let last: PunchFact | null = null;
-  // Fuera de toda ventana un día con turno no cuenta ninguna marcación (`countFrom = null`).
-  const counted = plan.countFrom === null ? [] : input.punches;
-  const fromMs = plan.countFrom === null ? nowMs : plan.countFrom.getTime();
-  for (const punch of counted) {
-    const at = punch.punchedAt.getTime();
-    if (at < fromMs || at > nowMs) {
-      continue;
-    }
-    if (last === null || at >= last.punchedAt.getTime()) {
-      last = punch;
-    }
-  }
-  return {
-    ...plan,
-    status: statusFromLastPunch(last?.action ?? null),
-    since: last === null ? null : last.punchedAt,
-  };
-};
-
-/**
- * Valida una marcación contra el día operativo ANTES de escribirla:
- *   - `CHECK_IN` fuera de ventana un día con turno → 409 `CLOCK_PUNCH_OUTSIDE_SHIFT_WINDOW`
- *     (`SSVCLK0003`): con `errors: [{ field: "opensAt", issue: <ISO> }]` si hay una apertura
- *     siguiente conocida (`BEFORE_SHIFT_WINDOW`), con `errors: []` si no (`AFTER_SHIFT_WINDOW`);
- *   - transición imposible desde el estado del periodo vigente → 409 `SSVCLK0002` (sin cambios).
- */
-export const assertPunchAllowed = (day: OperationalDay, action: ClockAction): void => {
-  if (action === "CHECK_IN") {
-    if (day.kind === "BEFORE_SHIFT_WINDOW" && day.window !== null) {
-      throw fail("CLOCK_PUNCH_OUTSIDE_SHIFT_WINDOW", [
-        { field: "opensAt", issue: day.window.opensAt.toISOString() },
-      ]);
-    }
-    if (day.kind === "AFTER_SHIFT_WINDOW") {
-      throw fail("CLOCK_PUNCH_OUTSIDE_SHIFT_WINDOW", []);
-    }
-  }
-  assertTransition(day.status, action);
 };

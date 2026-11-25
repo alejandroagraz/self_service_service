@@ -1,18 +1,26 @@
 /**
- * GAP-003 — `POST /api/v1/self-service/me/clock-punch` valida contra el MISMO día operativo que
- * `clock-status`: 409 `SSVCLK0003` antes de la apertura de la ventana y regresión del P0 (una
- * entrada sin cerrar de una ventana vencida ya no bloquea con 409 `SSVCLK0002`).
+ * GAP-043 §4 a (Lote 4.4B1, guardian C25) — `POST /api/v1/self-service/me/clock-punch` marca de forma
+ * SÍNCRONA contra la jornada consolidada de people, que es la única autoridad:
+ *   - `Idempotency-Key` opcional (uuid v4; inválida → 422); misma clave dos veces → una marcación y un
+ *     solo `attendance.punched`;
+ *   - los códigos de people se traducen a los del BFF (contrato §7) y nada se escribe;
+ *   - people caído o con el contrato roto → 503 sin escribir;
+ *   - el instante guardado y emitido es el OFICIAL de people;
+ *   - la clave de escritura y `X-Acting-User-Id` viajan en el POST.
  */
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
 import {
-  activeShiftOk,
   API,
-  assignmentJson,
   buildHarness,
+  okData,
+  peopleError,
+  TEST_SERVICE_KEY,
+  TEST_TIME_WRITE_KEY,
   vet,
+  workSessionJson,
   type Harness,
 } from "../support/http-harness";
 
@@ -21,21 +29,30 @@ let h: Harness;
 const TENANT = randomUUID();
 const EMPLOYEE = randomUUID();
 const USER = randomUUID();
+const SESSION = randomUUID();
 const TOKEN = "token-fichaje";
+const TOKEN_NO_PUNCH = "token-sin-fichaje";
 
-const NOC = assignmentJson("2026-11-22", "19:00", "07:00", "Guardia NOC Nocturna 12h", {
-  isNightShift: true,
-});
-const DAY_22 = assignmentJson("2026-11-22", "08:00", "16:00", "Diurno NOC 8h");
-const DAY_23 = assignmentJson("2026-11-23", "08:00", "16:00", "Diurno NOC 8h");
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-const punch = (action: string) =>
+/** Reloj del BFF y reloj (oficial) de people: difieren 20 s, dentro de la tolerancia de 5 min. */
+const BFF_NOW = vet("2026-11-23T07:55");
+const PEOPLE_CLOCK_IN = new Date(BFF_NOW.getTime() + 20_000);
+
+const punch = (action: string, idempotencyKey?: string, token = TOKEN) =>
   h.app.inject({
     method: "POST",
     url: `${API}/me/clock-punch`,
-    headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      ...(idempotencyKey === undefined ? {} : { "idempotency-key": idempotencyKey }),
+    },
     payload: { action },
   });
+
+const punchCalls = () =>
+  h.upstream.workSessionCalls.filter((call) => call.path.endsWith("/work-sessions/punches"));
 
 before(async () => {
   h = await buildHarness();
@@ -44,7 +61,17 @@ before(async () => {
     tenantId: TENANT,
     permissions: ["self_service:read", "self_service:punch"],
   });
+  h.upstream.principals.set(TOKEN_NO_PUNCH, {
+    userId: USER,
+    tenantId: TENANT,
+    permissions: ["self_service:read"],
+  });
   h.upstream.employees.set(TOKEN, { employeeId: EMPLOYEE, userId: USER, fullName: "Ana Pérez" });
+  h.upstream.employees.set(TOKEN_NO_PUNCH, {
+    employeeId: EMPLOYEE,
+    userId: USER,
+    fullName: "Ana Pérez",
+  });
 });
 
 after(async () => {
@@ -54,76 +81,290 @@ after(async () => {
 beforeEach(() => {
   h.uow.reset();
   h.upstream.peopleStatus = null;
-  h.upstream.activeShift = activeShiftOk("Guardia NOC Nocturna 12h", [NOC]);
+  h.upstream.workSessionCalls.length = 0;
+  h.upstream.activeShiftCalls.length = 0;
+  h.upstream.allCalls.length = 0;
+  h.clock.set(BFF_NOW);
+  h.upstream.punches = okData(
+    workSessionJson({ sessionId: SESSION, clockInAt: PEOPLE_CLOCK_IN.toISOString() }),
+  );
+  h.upstream.currentSession = okData(null);
 });
 
-test("NOC: CHECK_IN a las 17:59 → 409 SSVCLK0003 con opensAt; a las 18:00 → 200; nada se escribe en el 409", async () => {
-  h.clock.set(vet("2026-11-22T17:59"));
-  const early = await punch("CHECK_IN");
-  assert.equal(early.statusCode, 409);
-  assert.equal(early.json().code, "SSVCLK0003");
-  assert.deepEqual(early.json().errors, [{ field: "opensAt", issue: "2026-11-22T22:00:00.000Z" }]);
-  assert.equal(h.uow.punches.length, 0);
-  assert.equal(h.uow.outbox.length, 0);
-
-  h.clock.set(vet("2026-11-22T18:00"));
-  const onTime = await punch("CHECK_IN");
-  assert.equal(onTime.statusCode, 200);
-  assert.equal(onTime.json().data.status, "CLOCKED_IN");
-  assert.equal(h.uow.punches.length, 1);
-  assert.equal(h.uow.outbox.length, 1, "el fichaje emite attendance.punched en el mismo commit");
-});
-
-test("NOC cruzando medianoche: CHECK_OUT a las 07:05 de D+1 cierra la jornada abierta en D", async () => {
-  h.uow.seedPunch(TENANT, EMPLOYEE, "CHECK_IN", vet("2026-11-22T18:45"));
-  h.clock.set(vet("2026-11-23T07:05"));
-  const out = await punch("CHECK_OUT");
-  assert.equal(out.statusCode, 200);
-  assert.equal(out.json().data.status, "CLOCKED_OUT");
-});
-
-test("regresión P0: tras un día sin CHECK_OUT, el CHECK_IN de hoy ya no da 409 SSVCLK0002", async () => {
-  h.upstream.activeShift = activeShiftOk("Diurno NOC 8h", [DAY_22, DAY_23]);
-  h.uow.seedPunch(TENANT, EMPLOYEE, "CHECK_IN", vet("2026-11-22T08:02")); // nunca marcó la salida
-
-  // Dentro de la ventana de ayer la jornada sigue abierta: una segunda entrada sigue siendo inválida.
-  h.clock.set(vet("2026-11-22T17:19"));
-  const stillOpen = await punch("CHECK_IN");
-  assert.equal(stillOpen.statusCode, 409);
-  assert.equal(stillOpen.json().code, "SSVCLK0002");
-
-  // Hoy, dentro de la ventana de hoy: la entrada huérfana de ayer ya no cuenta.
-  h.clock.set(vet("2026-11-23T07:40"));
-  const today = await punch("CHECK_IN");
-  assert.equal(today.statusCode, 200);
-  assert.equal(today.json().data.status, "CLOCKED_IN");
-});
-
-test("regresión P0 sin turno al día siguiente: vencida la ventana, el CHECK_IN no da 409", async () => {
-  h.uow.seedPunch(TENANT, EMPLOYEE, "CHECK_IN", vet("2026-11-22T18:30"));
-  h.clock.set(vet("2026-11-23T08:21"));
+test("CHECK_IN 200: people (clave de escritura, X-Acting-User-Id) → fila + attendance.punched con el instante oficial", async () => {
   const res = await punch("CHECK_IN");
   assert.equal(res.statusCode, 200);
+  const data = res.json().data;
+  assert.match(data.id, UUID_V4, "sin Idempotency-Key, el BFF genera un uuid v4");
+  assert.deepEqual(data, {
+    id: data.id,
+    status: "CLOCKED_IN",
+    timestamp: PEOPLE_CLOCK_IN.toISOString(),
+    message: "Jornada laboral iniciada con éxito.",
+    sessionId: SESSION,
+  });
+
+  const [call] = punchCalls();
+  assert.equal(punchCalls().length, 1);
+  assert.equal(call.method, "POST");
+  assert.equal(call.apiKey, TEST_TIME_WRITE_KEY, "la marcación usa la clave de ESCRITURA");
+  assert.equal(call.serviceName, "self-service");
+  assert.equal(call.tenantId, TENANT);
+  assert.equal(call.actingUserId, USER, "X-Acting-User-Id = userId del principal verificado");
+  assert.equal(call.authorization, undefined, "no se reenvía el token del usuario");
+  assert.deepEqual(call.body, {
+    clockPunchId: data.id,
+    employeeId: EMPLOYEE,
+    action: "CHECK_IN",
+    punchedAt: BFF_NOW.toISOString(),
+  });
+
+  assert.equal(h.uow.punches.length, 1);
+  const stored = h.uow.punches[0].punch.toSnapshot();
+  assert.equal(stored.id, data.id, "id de la fila = clockPunchId");
+  assert.equal(stored.punchedAt.toISOString(), PEOPLE_CLOCK_IN.toISOString());
+  assert.equal(h.uow.outbox.length, 1);
+  assert.equal(h.uow.outbox[0].eventType, "attendance.punched");
+  assert.equal(h.uow.outbox[0].aggregateId, data.id);
+  assert.deepEqual(h.uow.outbox[0].payload, {
+    clockPunchId: data.id,
+    tenantId: TENANT,
+    employeeId: EMPLOYEE,
+    userId: USER,
+    action: "CHECK_IN",
+    punchedAt: PEOPLE_CLOCK_IN.toISOString(),
+  });
+  assert.equal(h.upstream.activeShiftCalls.length, 0, "el BFF ya no valida la ventana");
 });
 
-test("BREAK sin jornada abierta → 409 SSVCLK0002 (las transiciones no cambian)", async () => {
-  h.clock.set(vet("2026-11-22T20:00"));
-  const res = await punch("BREAK");
-  assert.equal(res.statusCode, 409);
-  assert.equal(res.json().code, "SSVCLK0002");
+test("idempotencia: la misma Idempotency-Key dos veces → una marcación y un solo attendance.punched", async () => {
+  const key = randomUUID();
+  const first = await punch("CHECK_IN", key);
+  h.clock.set(new Date(BFF_NOW.getTime() + 5_000)); // el reintento llega 5 s después
+  const second = await punch("CHECK_IN", key.toUpperCase());
+
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 200);
+  assert.deepEqual(second.json().data, first.json().data, "misma respuesta en el reintento");
+  assert.equal(first.json().data.id, key);
+  assert.deepEqual(
+    punchCalls().map((call) => call.body?.clockPunchId),
+    [key, key],
+    "people recibe el mismo clockPunchId (idempotente allí)",
+  );
+  assert.equal(h.uow.punches.length, 1, "ON CONFLICT (id) DO NOTHING");
+  assert.equal(h.uow.outbox.length, 1, "sin reencolar el evento");
 });
 
-test("503 SSVSLF0002 si active-shift no responde: no se ficha contra un día inventado", async () => {
-  h.upstream.activeShift = { status: 503, body: { success: false } };
-  h.clock.set(vet("2026-11-22T18:30"));
-  const res = await punch("CHECK_IN");
-  assert.equal(res.statusCode, 503);
-  assert.equal(res.json().code, "SSVSLF0002");
+test("una Idempotency-Key reutilizada para otra acción → 422 SSVCOM0001 sin escribir nada nuevo", async () => {
+  const key = randomUUID();
+  assert.equal((await punch("CHECK_IN", key)).statusCode, 200);
+  const reused = await punch("BREAK", key);
+  assert.equal(reused.statusCode, 422);
+  assert.equal(reused.json().code, "SSVCOM0001");
+  assert.equal(reused.json().errors[0].field, "idempotency-key");
+  assert.equal(h.uow.punches.length, 1);
+  assert.equal(h.uow.outbox.length, 1);
+});
+
+test("Idempotency-Key inválida (no uuid, uuid v1, vacía) → 422 SSVCOM0001 sin llamar a people", async () => {
+  for (const invalid of ["no-es-uuid", "6ba7b810-9dad-11d1-80b4-00c04fd430c8", ""]) {
+    const res = await punch("CHECK_IN", invalid);
+    assert.equal(res.statusCode, 422, `debe rechazarse: "${invalid}"`);
+    assert.equal(res.json().code, "SSVCOM0001");
+    assert.equal(res.json().errors[0].field, "idempotency-key");
+  }
+  assert.equal(punchCalls().length, 0);
   assert.equal(h.uow.punches.length, 0);
+});
+
+test("mapeo de códigos de people: cada uno a su código del BFF, propagando los detalles previstos, sin escribir", async () => {
+  const openSession = randomUUID();
+  const cases = [
+    {
+      people: peopleError(409, "TIMCLK0005", [
+        { field: "openSessionId", issue: openSession },
+        { field: "abandonAt", issue: "2026-11-23T21:20:00.000Z" },
+      ]),
+      status: 409,
+      code: "SSVCLK0002",
+      errors: [
+        { field: "openSessionId", issue: openSession },
+        { field: "abandonAt", issue: "2026-11-23T21:20:00.000Z" },
+      ],
+    },
+    {
+      people: peopleError(409, "TIMCLK0006", [
+        { field: "opensAt", issue: "2026-11-23T11:00:00.000Z" },
+      ]),
+      status: 409,
+      code: "SSVCLK0003",
+      errors: [{ field: "opensAt", issue: "2026-11-23T11:00:00.000Z" }],
+    },
+    { people: peopleError(409, "TIMCLK0010"), status: 409, code: "SSVCLK0002", errors: [] },
+    {
+      people: peopleError(422, "TIMCLK0011", [{ field: "punchedAt", issue: "interno" }]),
+      status: 422,
+      code: "SSVCLK0001",
+      errors: [],
+    },
+    {
+      people: peopleError(403, "TIMCLK0012", [{ field: "actingUserId", issue: "interno" }]),
+      status: 403,
+      code: "SSVCOM0003",
+      errors: [],
+    },
+  ];
+  for (const expected of cases) {
+    h.upstream.punches = expected.people;
+    const res = await punch("CHECK_IN");
+    const label = (expected.people.body as { code: string }).code;
+    assert.equal(res.statusCode, expected.status, label);
+    assert.equal(res.json().code, expected.code, label);
+    assert.deepEqual(res.json().errors, expected.errors, label);
+  }
+  assert.equal(h.uow.punches.length, 0);
+  assert.equal(h.uow.outbox.length, 0);
+});
+
+test("un código de people con un status que no le corresponde, o desconocido → 503 (no se adivina)", async () => {
+  for (const response of [
+    peopleError(422, "TIMCLK0005"),
+    peopleError(409, "TIMCLK0099"),
+    peopleError(401, "PPLCOM0002"),
+  ]) {
+    h.upstream.punches = response;
+    const res = await punch("CHECK_IN");
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.json().code, "SSVSLF0002");
+  }
+  assert.equal(h.uow.punches.length, 0);
+});
+
+test("people caído (5xx) o con el contrato de respuesta roto → 503 SSVSLF0002 sin escribir", async () => {
+  const withoutOnBreak = workSessionJson();
+  delete withoutOnBreak.onBreak;
+  for (const response of [
+    { status: 503, body: { success: false } },
+    okData({ ...workSessionJson(), sessionId: "no-es-uuid" }),
+    okData({ ...workSessionJson(), status: "IN_PROGRESS" }),
+    okData(withoutOnBreak),
+    okData(workSessionJson({ clockInAt: null })), // CHECK_IN sin instante oficial
+    { status: 200, body: { success: true } }, // sin data
+  ]) {
+    h.upstream.punches = response;
+    const res = await punch("CHECK_IN");
+    assert.equal(res.statusCode, 503, JSON.stringify(response.body));
+    assert.equal(res.json().code, "SSVSLF0002");
+  }
+  assert.equal(h.uow.punches.length, 0);
+  assert.equal(h.uow.outbox.length, 0);
+});
+
+test("CHECK_OUT tras un cierre automático: 200 y se guarda la salida registrada (postCloseCheckoutAt)", async () => {
+  const autoClose = vet("2026-11-23T17:20");
+  const lateOut = vet("2026-11-23T18:02");
+  h.upstream.punches = okData(
+    workSessionJson({
+      sessionId: SESSION,
+      status: "INCOMPLETE",
+      clockOutAt: autoClose.toISOString(),
+      closeReason: "AUTO_ABANDONED_CYCLE_1",
+      postCloseCheckoutAt: lateOut.toISOString(),
+    }),
+  );
+  h.clock.set(lateOut);
+  const res = await punch("CHECK_OUT");
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().data.status, "CLOCKED_OUT");
+  assert.equal(res.json().data.timestamp, lateOut.toISOString());
+  assert.equal(h.uow.punches[0].punch.punchedAt.toISOString(), lateOut.toISOString());
+});
+
+test("CHECK_OUT normal: se guarda clockOutAt de people", async () => {
+  const out = vet("2026-11-23T16:03");
+  h.upstream.punches = okData(
+    workSessionJson({
+      sessionId: SESSION,
+      status: "COMPLETED",
+      punctuality: "ON_TIME",
+      clockOutAt: out.toISOString(),
+      closeReason: "EMPLOYEE_CHECKOUT",
+    }),
+  );
+  h.clock.set(new Date(out.getTime() - 10_000));
+  const res = await punch("CHECK_OUT");
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().data.timestamp, out.toISOString());
+});
+
+test("BREAK: people no devuelve instante (no muta la jornada) → se guarda el punchedAt enviado", async () => {
+  const breakAt = vet("2026-11-23T12:00");
+  h.clock.set(breakAt);
+  const res = await punch("BREAK");
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().data.status, "ON_BREAK");
+  assert.equal(res.json().data.timestamp, breakAt.toISOString());
+  assert.equal(h.uow.punches[0].punch.punchedAt.toISOString(), breakAt.toISOString());
+  assert.equal(h.uow.outbox.length, 1);
+});
+
+test("reanudación tras pausa (contrato §3): BREAK → CHECK_IN 200, people decide y el estado vuelve a CLOCKED_IN", async () => {
+  const clockIn = vet("2026-11-23T08:00");
+  const session = (onBreak: boolean) =>
+    okData(workSessionJson({ sessionId: SESSION, clockInAt: clockIn.toISOString(), onBreak }));
+
+  const breakAt = vet("2026-11-23T12:00");
+  h.clock.set(breakAt);
+  h.upstream.punches = session(true);
+  const paused = await punch("BREAK", randomUUID());
+  assert.equal(paused.statusCode, 200);
+  assert.equal(paused.json().data.status, "ON_BREAK");
+  h.upstream.currentSession = session(true);
+  const statusOnBreak = await h.app.inject({
+    method: "GET",
+    url: `${API}/me/clock-status`,
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  assert.equal(statusOnBreak.json().data.status, "ON_BREAK");
+  assert.equal(statusOnBreak.json().data.since, breakAt.toISOString());
+
+  // El BFF pasa el CHECK_IN a people sin reglas propias; people responde 200 (reanudación).
+  const resumeAt = vet("2026-11-23T12:45");
+  h.clock.set(resumeAt);
+  h.upstream.punches = session(false);
+  const resumed = await punch("CHECK_IN", randomUUID());
+  assert.equal(resumed.statusCode, 200);
+  assert.equal(resumed.json().data.status, "CLOCKED_IN");
+  // people no devuelve el instante de la reanudación (clockInAt es la entrada de la jornada): se
+  // guarda el punchedAt enviado.
+  assert.equal(resumed.json().data.timestamp, resumeAt.toISOString());
+  assert.deepEqual(
+    punchCalls().map((call) => call.body?.action),
+    ["BREAK", "CHECK_IN"],
+  );
+  assert.equal(h.uow.punches.length, 2);
+  assert.equal(h.uow.outbox.length, 2);
+  assert.equal(h.uow.outbox[1].payload.punchedAt, resumeAt.toISOString());
+
+  h.upstream.currentSession = session(false);
+  const statusResumed = await h.app.inject({
+    method: "GET",
+    url: `${API}/me/clock-status`,
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  assert.equal(statusResumed.json().data.status, "CLOCKED_IN");
+  assert.equal(statusResumed.json().data.since, resumeAt.toISOString());
+});
+
+test("403 SSVCOM0003 sin self_service:punch: ni people ni escritura", async () => {
+  const res = await punch("CHECK_IN", undefined, TOKEN_NO_PUNCH);
+  assert.equal(res.statusCode, 403);
+  assert.equal(res.json().code, "SSVCOM0003");
+  assert.equal(punchCalls().length, 0);
 });
 
 test("cuerpo inválido → 422 SSVCOM0001 de class-validator (el schema de Fastify no valida)", async () => {
-  h.clock.set(vet("2026-11-22T18:30"));
   const res = await h.app.inject({
     method: "POST",
     url: `${API}/me/clock-punch`,
@@ -132,39 +373,31 @@ test("cuerpo inválido → 422 SSVCOM0001 de class-validator (el schema de Fasti
   });
   assert.equal(res.statusCode, 422);
   assert.equal(res.json().code, "SSVCOM0001");
+  assert.equal(punchCalls().length, 0);
 });
 
-test("día con turno, 20:00 tras el turno de hoy y con turno mañana → 409 SSVCLK0003 con la apertura de mañana", async () => {
-  h.upstream.activeShift = activeShiftOk("Diurno NOC 8h", [DAY_22, DAY_23]);
-  h.clock.set(vet("2026-11-22T20:00"));
-  const res = await punch("CHECK_IN");
-  assert.equal(res.statusCode, 409);
-  assert.equal(res.json().code, "SSVCLK0003");
-  assert.deepEqual(res.json().errors, [{ field: "opensAt", issue: "2026-11-23T11:00:00.000Z" }]);
-  assert.equal(h.uow.punches.length, 0);
-});
-
-test("día con turno y sin turno mañana: 20:00 → NOT_STARTED, CHECK_OUT tardío 409 SSVCLK0002 y CHECK_IN 409 SSVCLK0003 con errors []", async () => {
-  h.upstream.activeShift = activeShiftOk("Diurno NOC 8h", [DAY_22]);
-  h.uow.seedPunch(TENANT, EMPLOYEE, "CHECK_IN", vet("2026-11-22T08:02")); // nunca marcó la salida
-  h.clock.set(vet("2026-11-22T20:00"));
-
-  const lateOut = await punch("CHECK_OUT");
-  assert.equal(lateOut.statusCode, 409);
-  assert.equal(lateOut.json().code, "SSVCLK0002");
-
-  const checkIn = await punch("CHECK_IN");
-  assert.equal(checkIn.statusCode, 409);
-  assert.equal(checkIn.json().code, "SSVCLK0003");
-  assert.deepEqual(checkIn.json().errors, []);
-  assert.equal(h.uow.punches.length, 1, "solo la entrada huérfana sembrada; nada nuevo");
-});
-
-test("00:30 del día siguiente sin turno ese día: día natural, el CHECK_IN se admite", async () => {
-  h.upstream.activeShift = activeShiftOk(null, [DAY_22]);
-  h.uow.seedPunch(TENANT, EMPLOYEE, "CHECK_IN", vet("2026-11-22T08:02")); // sin salida
-  h.clock.set(vet("2026-11-23T00:30"));
-  const res = await punch("CHECK_IN");
-  assert.equal(res.statusCode, 200);
-  assert.equal(res.json().data.status, "CLOCKED_IN");
+test("C12: la clave de escritura solo viaja en los POST de work-sessions; los GET usan la de lectura", async () => {
+  assert.equal((await punch("CHECK_IN")).statusCode, 200);
+  await h.app.inject({
+    method: "GET",
+    url: `${API}/me/clock-status`,
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  await h.app.inject({
+    method: "GET",
+    url: `${API}/me/profile`,
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  const withWriteKey = h.upstream.allCalls.filter((call) => call.apiKey === TEST_TIME_WRITE_KEY);
+  assert.ok(withWriteKey.length > 0);
+  for (const call of withWriteKey) {
+    assert.equal(call.method, "POST", `${call.method} ${call.path} con la clave de escritura`);
+    assert.match(call.path, /^\/api\/v1\/time\/internal\/work-sessions\//);
+  }
+  const currentCalls = h.upstream.workSessionCalls.filter((call) => call.method === "GET");
+  assert.equal(currentCalls.length, 2, "clock-status y profile leen la jornada vigente");
+  for (const call of currentCalls) {
+    assert.equal(call.apiKey, TEST_SERVICE_KEY, "GET current con la clave de LECTURA");
+    assert.equal(call.actingUserId, USER);
+  }
 });

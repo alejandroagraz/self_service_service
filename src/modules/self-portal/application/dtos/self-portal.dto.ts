@@ -16,13 +16,18 @@ import { Doc } from "../../../../shared/application/dto-docs";
 import {
   CLOCK_ACTIONS,
   CLOCK_STATUSES,
+  OVERRUN_ANSWERS,
+  SESSION_STATUSES,
   type ClockAction,
   type ClockStatus,
+  type OverrunAnswer,
+  type SessionStatus,
 } from "../../domain/services/clock-status";
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const HH_MM_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 const CLOCK_STATUS_VALUES = CLOCK_STATUSES as unknown as string[];
+const SESSION_STATUS_VALUES = SESSION_STATUSES as unknown as string[];
 
 /*
  * Clases de RESPUESTA (DEC-16 = A): existen solo para que el OpenAPI se GENERE del mismo tipo que
@@ -47,6 +52,23 @@ export class ClockPunchRequestDto {
   @IsString()
   @MaxLength(500)
   note?: string;
+}
+
+/**
+ * Cabeceras de `POST /me/clock-punch` (Lote 4.4B1, guardian C25). `Idempotency-Key` es OPCIONAL: un
+ * uuid v4 que el portal genera por pulsación y repite en los reintentos de esa misma pulsación. Es el
+ * `clockPunchId` (idempotencia en people y `id` de la fila de `clock_punches`). Presente pero vacía,
+ * repetida o que no sea uuid v4 → 422 `SSVCOM0001`. El controller solo pasa esta cabecera.
+ */
+export class ClockPunchHeadersDto {
+  @IsOptional()
+  @IsUUID("4", { message: "Idempotency-Key debe ser un UUID v4." })
+  @Doc({
+    format: "uuid",
+    description:
+      "Opcional. UUID v4 por pulsación, el mismo en sus reintentos: la marcación y su evento no se duplican.",
+  })
+  "idempotency-key"?: string;
 }
 
 /**
@@ -126,7 +148,10 @@ export class EmployeeSelfProfileDto {
   readonly lastClockInAt!: string | null;
 }
 
-/** Respuesta de `POST /me/clock-punch`. */
+/**
+ * Respuesta de `POST /me/clock-punch`. `id` es el `clockPunchId` (la `Idempotency-Key` si llegó) y
+ * `timestamp` el instante OFICIAL de people (o el de la pausa, que people no registra).
+ */
 export class ClockPunchResultDto {
   @IsUUID()
   readonly id!: string;
@@ -140,6 +165,10 @@ export class ClockPunchResultDto {
 
   @IsString()
   readonly message!: string;
+
+  @IsUUID()
+  @Doc({ description: "Jornada consolidada de people a la que se aplicó la marcación." })
+  readonly sessionId!: string;
 }
 
 /** Turno de la asignación vigente en `GET /me/clock-status`. */
@@ -178,7 +207,37 @@ export class ClockStatusWindowDto {
   readonly abandonAt!: string;
 }
 
-/** Estado de jornada real del empleado (`GET /me/clock-status`, GAP-003). */
+/** Aviso de fin de turno abierto sobre la jornada vigente (`overrun` de `GET /me/clock-status`). */
+export class ClockStatusOverrunDto {
+  @IsUUID()
+  readonly sessionId!: string;
+
+  @IsInt()
+  @Doc({
+    description:
+      "Ciclo de avisos (1 tras el fin del turno; 2 tras responder «Sí» y agotar el tope).",
+  })
+  readonly cycle!: number;
+
+  @IsInt()
+  readonly noticesSent!: number;
+
+  @IsString()
+  @Doc({ format: "date-time", nullable: true, description: "Próximo aviso; null si no quedan." })
+  readonly nextNoticeAt!: string | null;
+
+  @IsString()
+  @Doc({ format: "date-time", description: "Cierre automático si no hay respuesta." })
+  readonly abandonAt!: string;
+
+  @IsBoolean()
+  @Doc({
+    description: "true si hay un aviso pendiente de responder (botones Sigo trabajando / Terminé).",
+  })
+  readonly awaitingAnswer!: boolean;
+}
+
+/** Estado de jornada real del empleado (`GET /me/clock-status`, GAP-003 + GAP-043). */
 export class ClockStatusDto {
   @IsIn(CLOCK_STATUS_VALUES)
   readonly status!: ClockStatus;
@@ -219,6 +278,72 @@ export class ClockStatusDto {
 
   @IsInt()
   readonly earlyDepartureGraceMinutes!: number;
+
+  @IsUUID()
+  @Doc({ nullable: true, description: "Jornada vigente de people; null si no hay ninguna." })
+  readonly sessionId!: string | null;
+
+  @IsIn(SESSION_STATUS_VALUES)
+  @Doc({ nullable: true, description: "Ciclo de vida de la jornada vigente; null sin jornada." })
+  readonly sessionStatus!: SessionStatus | null;
+
+  @Doc({
+    nested: () => ClockStatusOverrunDto,
+    nullable: true,
+    description: "Aviso de fin de turno de la jornada vigente; null si no hay ninguno.",
+  })
+  readonly overrun!: ClockStatusOverrunDto | null;
+
+  @IsString()
+  @Doc({
+    format: "date-time",
+    nullable: true,
+    description: "Salida marcada después de un cierre automático de la jornada.",
+  })
+  readonly postCloseCheckoutAt!: string | null;
+
+  @IsInt()
+  @Doc({
+    nullable: true,
+    description: "Minutos fuera del turno que superaron el saldo de horas extra; null sin jornada.",
+  })
+  readonly unrecordedOvertimeMinutes!: number | null;
+}
+
+/** Parámetros de ruta de `POST /me/shift-overruns/:sessionId/answer` (422 si no es un UUID). */
+export class ShiftOverrunAnswerParamsDto {
+  @IsUUID()
+  sessionId!: string;
+}
+
+/** Cuerpo de `POST /me/shift-overruns/:sessionId/answer` (GAP-043 §4 c). */
+export class ShiftOverrunAnswerRequestDto {
+  @IsString()
+  @IsIn(OVERRUN_ANSWERS as unknown as string[], {
+    message: `answer debe ser una de: ${OVERRUN_ANSWERS.join(", ")}.`,
+  })
+  answer!: OverrunAnswer;
+}
+
+/** Respuesta de `POST /me/shift-overruns/:sessionId/answer`. */
+export class ShiftOverrunAnswerResultDto {
+  @IsUUID()
+  readonly sessionId!: string;
+
+  @IsIn(SESSION_STATUS_VALUES)
+  @Doc({ description: "Ciclo de vida de la jornada tras la respuesta." })
+  readonly status!: SessionStatus;
+
+  @IsUUID()
+  @Doc({
+    nullable: true,
+    description: "Solicitud de horas extra provisional enlazada (respuesta CONTINUE), o null.",
+  })
+  readonly overtimeRequestId!: string | null;
+
+  @IsString()
+  @Doc({ format: "date-time" })
+  readonly answeredAt!: string;
 }
 
 /** Tipo de celebración expuesto por el BFF (`GET /me/celebrations`). */

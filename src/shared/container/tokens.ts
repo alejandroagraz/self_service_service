@@ -29,6 +29,9 @@ export const TOKENS = {
   PayrollClient: Symbol.for("IPayrollClient"),
   AbsencesClient: Symbol.for("IAbsencesClient"),
   TimeClient: Symbol.for("ITimeClient"),
+  // Jornada consolidada de people (GAP-043, Lote 4.4B1): marcación síncrona, jornada vigente y
+  // respuesta al aviso de fin de turno. Clave de escritura en los POST, de lectura en el GET.
+  WorkSessionClient: Symbol.for("IWorkSessionClient"),
   // Descarga de confianza del PDF de un recibo propio (GAP-012), clave per-caller ante documents.
   DocumentsClient: Symbol.for("IDocumentsClient"),
 } as const;

@@ -9,7 +9,8 @@
  *     `internal` si la ruta no exige permiso; `internal` ⇔ `x-internal: true`;
  *   - los `operationId` no se repiten;
  *   - el documento publicado (`GET /docs/openapi.json`) no contiene operaciones `x-internal` y sí
- *     las rutas documentadas, y la respuesta real de `clock-status` tiene la forma documentada;
+ *     las rutas documentadas, y las respuestas reales de `clock-status` (con jornada y aviso),
+ *     `clock-punch` y `shift-overruns/:sessionId/answer` tienen la forma documentada;
  *   - regresión: con el validador de Fastify desactivado, un cuerpo inválido sigue dando 422.
  */
 import { after, before, test } from "node:test";
@@ -23,7 +24,9 @@ import {
   API,
   assignmentJson,
   buildHarness,
+  okData,
   vet,
+  workSessionJson,
   type Harness,
 } from "../support/http-harness";
 import { routeCatalogOf } from "../../src/shared/infrastructure/http/openapi/openapi";
@@ -48,6 +51,7 @@ const TOKEN = "token-contrato";
 const TENANT = randomUUID();
 const EMPLOYEE = randomUUID();
 const USER = randomUUID();
+const SESSION = randomUUID();
 
 before(async () => {
   h = await buildHarness();
@@ -57,11 +61,34 @@ before(async () => {
     permissions: ["self_service:read", "self_service:punch"],
   });
   h.upstream.employees.set(TOKEN, { employeeId: EMPLOYEE, userId: USER, fullName: "Ana Pérez" });
-  h.upstream.activeShift = activeShiftOk("Guardia NOC Nocturna 12h", [
-    assignmentJson("2026-11-22", "19:00", "07:00", "Guardia NOC Nocturna 12h", {
-      isNightShift: true,
-    }),
-  ]);
+  const noc = assignmentJson("2026-11-22", "19:00", "07:00", "Guardia NOC Nocturna 12h", {
+    isNightShift: true,
+  });
+  h.upstream.activeShift = activeShiftOk("Guardia NOC Nocturna 12h", [noc]);
+  const session = workSessionJson({
+    sessionId: SESSION,
+    workDate: "2026-11-22",
+    shiftAssignmentId: randomUUID(),
+    scheduledStartAt: noc.startAt,
+    scheduledEndAt: noc.endAt,
+    clockInAt: vet("2026-11-22T18:30").toISOString(),
+    overrun: {
+      sessionId: SESSION,
+      cycle: 1,
+      noticesSent: 1,
+      nextNoticeAt: vet("2026-11-23T07:30").toISOString(),
+      abandonAt: vet("2026-11-23T08:20").toISOString(),
+      awaitingAnswer: true,
+    },
+  });
+  h.upstream.currentSession = okData(session);
+  h.upstream.punches = okData(session);
+  h.upstream.overrunAnswer = okData({
+    sessionId: SESSION,
+    status: "ACTIVE",
+    overtimeRequestId: randomUUID(),
+    answeredAt: vet("2026-11-23T07:31").toISOString(),
+  });
 });
 
 after(async () => {
@@ -203,6 +230,63 @@ const assertShape = (value: unknown, rawSchema: Json, where: string): void => {
     assertShape(child, properties[name], `${where}.${name}`);
   }
 };
+
+/** Esquema 200 documentado de una ruta del catálogo. */
+const okSchemaOf = (method: string, url: string): Json => {
+  const route = routeCatalogOf(h.app).find((r) => r.method === method && r.url === url);
+  return (route?.schema?.response as Record<string, Json>)["200"];
+};
+
+test("las respuestas reales de clock-punch y del aviso de fin de turno tienen la forma documentada", async () => {
+  h.clock.set(vet("2026-11-23T07:31"));
+  const punch = await h.app.inject({
+    method: "POST",
+    url: `${API}/me/clock-punch`,
+    headers: {
+      authorization: `Bearer ${TOKEN}`,
+      "content-type": "application/json",
+      "idempotency-key": randomUUID(),
+    },
+    payload: { action: "BREAK" },
+  });
+  assert.equal(punch.statusCode, 200);
+  assertShape(punch.json(), okSchemaOf("POST", `${API}/me/clock-punch`), "clock-punch");
+
+  const answer = await h.app.inject({
+    method: "POST",
+    url: `${API}/me/shift-overruns/${SESSION}/answer`,
+    headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+    payload: { answer: "CONTINUE" },
+  });
+  assert.equal(answer.statusCode, 200);
+  assertShape(
+    answer.json(),
+    okSchemaOf("POST", `${API}/me/shift-overruns/:sessionId/answer`),
+    "shift-overrun-answer",
+  );
+});
+
+test("el documento declara la cabecera Idempotency-Key de clock-punch y los 404/409 del aviso", async () => {
+  const document = (
+    await h.app.inject({ method: "GET", url: `${API}/docs/openapi.json` })
+  ).json() as { paths: Record<string, Record<string, Json>> };
+  const punch = document.paths[`${API}/me/clock-punch`]?.post as Json;
+  const parameters = (punch.parameters ?? []) as Json[];
+  assert.ok(
+    parameters.some(
+      (p) => p.in === "header" && p.name === "idempotency-key" && p.required !== true,
+    ),
+    "falta la cabecera opcional idempotency-key",
+  );
+  const answer = document.paths[`${API}/me/shift-overruns/{sessionId}/answer`]?.post as Json;
+  const codesOf = (status: string): unknown =>
+    (
+      ((((answer.responses as Json)[status] as Json).content as Json)["application/json"] as Json)
+        .schema as Json
+    ).properties;
+  assert.deepEqual(((codesOf("404") as Json).code as Json).enum, ["SSVSLF0001", "SSVSHF0001"]);
+  assert.deepEqual(((codesOf("409") as Json).code as Json).enum, ["SSVSHF0002"]);
+});
 
 test("la respuesta real de clock-status tiene exactamente la forma documentada", async () => {
   h.uow.seedPunch(TENANT, EMPLOYEE, "CHECK_IN", vet("2026-11-22T18:30"));

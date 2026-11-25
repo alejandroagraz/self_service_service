@@ -21,6 +21,12 @@ export interface IClockPunchRepository {
     startInclusive: Date,
     endExclusive: Date,
   ): Promise<readonly ClockPunch[]>;
-  /** Inserta una marcación nueva (append-only). */
-  save(punch: ClockPunch): Promise<void>;
+  /** La marcación con ese `id` (visible bajo RLS), o `null`. */
+  findById(id: string): Promise<ClockPunch | null>;
+  /**
+   * Inserta una marcación nueva (append-only) con `ON CONFLICT (id) DO NOTHING`: el `id` es el
+   * `clockPunchId` idempotente (Lote 4.4B1, C25). Devuelve `true` si la insertó y `false` si ya
+   * existía una fila con ese `id` (reintento de la misma pulsación): el llamador no reencola el evento.
+   */
+  insertIfAbsent(punch: ClockPunch): Promise<boolean>;
 }

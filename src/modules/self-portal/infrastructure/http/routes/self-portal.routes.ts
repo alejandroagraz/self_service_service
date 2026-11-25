@@ -6,12 +6,13 @@
  *     `/me/payslips/:payslipId/content`, `/me/celebrations`, `/me/absences`, `/me/punctuality`):
  *     `self_service:read`.
  *   - lectura de manager (`/me/team-status`): `team:read` (si falta, el preHandler responde 403).
- *   - escritura (`/me/clock-punch`): `self_service:punch`.
+ *   - escritura (`/me/clock-punch`, `/me/shift-overruns/:sessionId/answer`): `self_service:punch`.
  *
  * La ruta solo declara método, path, hooks y su `schema` de documentación, y delega en el controller
  * resuelto del contenedor. DEC-16 = A (modo transitorio): las rutas nuevas o modificadas desde el Lote
  * 3.3 (`/me/profile`, `/me/clock-status`, `/me/clock-punch`, desde el 4.2
- * `/me/payslips/:payslipId/content` y desde el 4.4A `/me/absences`) declaran `schema` (`routeSchema`); el
+ * `/me/payslips/:payslipId/content`, desde el 4.4A `/me/absences` y desde el 4.4B1
+ * `/me/shift-overruns/:sessionId/answer`) declaran `schema` (`routeSchema`); el
  * resto lo completa el Lote 6.1. El `schema` NO valida: class-validator sigue siendo el validador.
  */
 import type { FastifyInstance } from "fastify";
@@ -26,6 +27,7 @@ import {
   routeSchema,
 } from "../../../../../shared/infrastructure/http/openapi/route-schema";
 import {
+  ClockPunchHeadersDto,
   ClockPunchRequestDto,
   ClockPunchResultDto,
   ClockStatusDto,
@@ -34,6 +36,9 @@ import {
   MyAbsencesQueryDto,
   MyMonthAbsenceDto,
   PayslipContentParamsDto,
+  ShiftOverrunAnswerParamsDto,
+  ShiftOverrunAnswerRequestDto,
+  ShiftOverrunAnswerResultDto,
 } from "../../../application/dtos/self-portal.dto";
 import { SelfPortalController } from "../controllers/self-portal.controller";
 
@@ -52,7 +57,7 @@ export const registerSelfPortalRoutes = (app: FastifyInstance): void => {
         operationId: "getMySelfServiceProfile",
         summary: "Perfil de autoservicio del empleado autenticado.",
         description:
-          "currentClockStatus se calcula con el mismo día operativo que GET /me/clock-status (GAP-003).",
+          "currentClockStatus sale de la misma fuente que GET /me/clock-status (jornada vigente de people, GAP-043); si people no la devuelve, degrada a NOT_STARTED.",
         tags: [TAG],
         permission: READ_PERMISSION,
         response: { description: "Perfil del colaborador.", data: EmployeeSelfProfileDto },
@@ -72,9 +77,9 @@ export const registerSelfPortalRoutes = (app: FastifyInstance): void => {
       preHandler: [authenticate, requirePermission(READ_PERMISSION)],
       schema: routeSchema({
         operationId: "getMyClockStatus",
-        summary: "Estado de jornada real del empleado autenticado (día operativo vigente).",
+        summary: "Estado de jornada real del empleado autenticado (jornada vigente de people).",
         description:
-          "Ventana del turno [inicio − ventana previa, min(fin + umbral de abandono, apertura del turno siguiente)). Fuera de ventana un día con turno, vale la siguiente asignación (o la última de hoy si no hay siguiente). Solo sin turno ese día rige el día natural VET (window = null).",
+          "Fuente: la jornada consolidada de people (work-sessions/current, GAP-043): sessionId, sessionStatus, overrun (aviso de fin de turno pendiente), postCloseCheckoutAt y unrecordedOvertimeMinutes; status se traduce de ella (ON_BREAK = onBreak de people). shift/window salen de active-shift: el turno programado de la jornada vigente o, sin él, la ventana [inicio − ventana previa, min(fin + umbral de abandono, apertura del turno siguiente)) que contiene ahora, la siguiente asignación o la última de hoy; sin turno ese día, día natural VET (window = null). people o time caídos → 503.",
         tags: [TAG],
         permission: READ_PERMISSION,
         response: { description: "Estado de jornada.", data: ClockStatusDto },
@@ -135,9 +140,10 @@ export const registerSelfPortalRoutes = (app: FastifyInstance): void => {
         operationId: "punchMyClock",
         summary: "Registra una marcación (entrada, pausa o salida) del empleado autenticado.",
         description:
-          'Un día con turno, un CHECK_IN fuera de ventana responde 409 SSVCLK0003 con errors[{field:"opensAt"}] (próxima apertura) o errors [] si no hay turno siguiente en el horizonte. Una entrada sin cerrar de una ventana ya vencida no bloquea la siguiente.',
+          'Marcación síncrona contra la jornada de people (única autoridad, GAP-043). Idempotency-Key opcional (UUID v4 por pulsación, el mismo en sus reintentos): la marcación y su evento no se duplican; inválida o reutilizada para otra marcación → 422 SSVCOM0001. 409 SSVCLK0002 si ya hay una jornada abierta (errors[{field:"openSessionId"},{field:"abandonAt"}]) o si se marca salida/pausa sin jornada abierta; 409 SSVCLK0003 si la entrada es anterior a la apertura de la ventana (errors[{field:"opensAt"}] si se conoce); 422 SSVCLK0001 si el reloj se desvía más de 5 min del de people; 403 SSVCOM0003 si people no reconoce al usuario como dueño de la ficha; 503 si people no responde (nada se escribe). timestamp es el instante oficial de people.',
         tags: [TAG],
         permission: PUNCH_PERMISSION,
+        headers: ClockPunchHeadersDto,
         body: ClockPunchRequestDto,
         response: { description: "Marcación registrada.", data: ClockPunchResultDto },
         errors: [
@@ -155,6 +161,36 @@ export const registerSelfPortalRoutes = (app: FastifyInstance): void => {
       }),
     },
     (request, reply) => controller.punch(request, reply),
+  );
+
+  app.post(
+    "/me/shift-overruns/:sessionId/answer",
+    {
+      preHandler: [authenticate, requirePermission(PUNCH_PERMISSION)],
+      schema: routeSchema({
+        operationId: "answerMyShiftOverrun",
+        summary: "Responde al aviso de fin de turno de una jornada propia (GAP-043).",
+        description:
+          "answer CONTINUE («Sigo trabajando») o END («Terminé»). El empleado se resuelve en el servidor; una jornada inexistente o ajena responde 404 SSVSHF0001 sin distinguirlas. 409 SSVSHF0002 si no hay ningún aviso abierto (ya respondido, jornada cerrada o vencida). Repetir la misma respuesta ya aplicada devuelve 200 con el mismo estado. people caído → 503.",
+        tags: [TAG],
+        permission: PUNCH_PERMISSION,
+        params: ShiftOverrunAnswerParamsDto,
+        body: ShiftOverrunAnswerRequestDto,
+        response: { description: "Respuesta registrada.", data: ShiftOverrunAnswerResultDto },
+        errors: [
+          ...AUTHENTICATED_ROUTE_ERRORS,
+          "MALFORMED_REQUEST",
+          "UNSUPPORTED_MEDIA_TYPE",
+          "PAYLOAD_TOO_LARGE",
+          "VALIDATION_FAILED",
+          "SELF_PROFILE_NOT_LINKED",
+          "SHIFT_OVERRUN_SESSION_NOT_FOUND",
+          "SHIFT_OVERRUN_NOT_OPEN",
+          "SELF_UPSTREAM_UNAVAILABLE",
+        ],
+      }),
+    },
+    (request, reply) => controller.answerShiftOverrun(request, reply),
   );
 
   app.get(

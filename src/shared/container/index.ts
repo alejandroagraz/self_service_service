@@ -21,6 +21,7 @@ import { PayrollClient } from "../infrastructure/http/payroll-client";
 import { PeopleClient } from "../infrastructure/http/people-client";
 import { PeopleInternalClient } from "../infrastructure/http/people-internal-client";
 import { TimeClient } from "../infrastructure/http/time-client";
+import { WorkSessionClient } from "../infrastructure/http/work-session-client";
 import { DayjsClock } from "../infrastructure/services/dayjs-clock";
 import { UuidV4IdGenerator } from "../infrastructure/services/uuid-v4-id-generator";
 import { rootLogger } from "../infrastructure/services/winston-logger";
@@ -65,7 +66,8 @@ export const registerIdentityClient = (
  * per-pair (`http-secrets.ts`); el rol worker no lo llama (no sirve HTTP ni compone vistas).
  *
  * `people` (pass-through) reenvía el token del usuario (sin clave); `payroll`/`absences`/`time`/
- * `documents` son de confianza per-pair, cada uno con SU clave dedicada. Todos comparten el timeout de
+ * `documents` son de confianza per-pair, cada uno con SU clave dedicada. `WorkSessionClient` (jornada
+ * de time, Lote 4.4B1) lleva DOS: la de lectura de time en el GET y la de escritura en los POST (C12). Todos comparten el timeout de
  * upstream (en `documents`, hasta recibir las cabeceras: el cuerpo fluye en stream).
  *
  * `PeopleInternalClient` es el canal trusted-service hacia people (`/api/v1/people/internal/*`:
@@ -96,6 +98,15 @@ export const registerOutboundClients = (secrets: HttpSecrets): void => {
   container.registerInstance(
     TOKENS.TimeClient,
     new TimeClient(env.TIME_INTERNAL_URL, secrets.timeReadKey, env.UPSTREAM_TIMEOUT_MS),
+  );
+  container.registerInstance(
+    TOKENS.WorkSessionClient,
+    new WorkSessionClient(
+      env.TIME_INTERNAL_URL,
+      secrets.timeReadKey,
+      secrets.timeWriteKey,
+      env.UPSTREAM_TIMEOUT_MS,
+    ),
   );
   container.registerInstance(
     TOKENS.DocumentsClient,

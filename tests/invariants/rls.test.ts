@@ -19,6 +19,10 @@
  * ven las marcaciones del tenant B aunque compartan `employee_id`, y que existe el índice
  * `(tenant_id, employee_id, punched_at DESC)` que las sirve (01B GAP-003 §3: no hace falta la
  * migración `1794700000020`).
+ *
+ * Ampliación GAP-043 (Lote 4.4B1, C25): la marcación idempotente inserta con `ON CONFLICT (id) DO
+ * NOTHING` como `app_self_service` (solo INSERT/SELECT): el reintento no duplica, y un `id` que ya
+ * existe en OTRO tenant ni se pisa ni se vuelve visible.
  */
 import { randomUUID } from "node:crypto";
 import { after, before, test } from "node:test";
@@ -26,6 +30,7 @@ import assert from "node:assert/strict";
 
 import type { DataSource } from "typeorm";
 
+import { ClockPunch } from "../../src/modules/self-portal/domain/entities/clock-punch.entity";
 import { TypeOrmClockPunchRepository } from "../../src/modules/self-portal/infrastructure/repositories/typeorm-clock-punch.repository";
 import { ClockPunchModel } from "../../src/shared/infrastructure/database/models/clock-punch.model";
 import { asApp, asMigrator, inTenantTx } from "../support/test-datasource";
@@ -41,6 +46,7 @@ const idB = randomUUID();
 const sharedEmployee = randomUUID();
 const idSharedA = randomUUID();
 const idSharedB = randomUUID();
+const idIdempotent = randomUUID();
 
 before(async () => {
   app = asApp([ClockPunchModel]);
@@ -70,7 +76,7 @@ before(async () => {
 
 after(async () => {
   await migrator.query(`DELETE FROM self_service.clock_punches WHERE id = ANY($1)`, [
-    [idA, idB, idSharedA, idSharedB],
+    [idA, idB, idSharedA, idSharedB, idIdempotent],
   ]);
   await app.destroy();
   await migrator.destroy();
@@ -161,4 +167,62 @@ test("GAP-003: existe el índice (tenant_id, employee_id, punched_at DESC) sobre
   )) as { indexdef: string }[];
   assert.equal(rows.length, 1, "falta el índice ix_clock_punches_tenant_employee_punched");
   assert.match(rows[0].indexdef, /\(tenant_id, employee_id, punched_at DESC\)/);
+});
+
+test("GAP-043: insertIfAbsent es idempotente por id (ON CONFLICT DO NOTHING) y no cruza tenants", async () => {
+  const punchOf = (id: string, tenantId: string): ClockPunch =>
+    ClockPunch.create({
+      id,
+      tenantId,
+      employeeId: sharedEmployee,
+      userId: randomUUID(),
+      action: "CHECK_OUT",
+      note: null,
+      punchedAt: new Date("2027-03-01T17:00:00Z"),
+      now: new Date("2027-03-01T17:00:01Z"),
+    });
+  const inTenantRepo = async <T>(
+    tenantId: string,
+    job: (repo: TypeOrmClockPunchRepository) => Promise<T>,
+  ): Promise<T> => {
+    const runner = app.createQueryRunner();
+    await runner.connect();
+    await runner.startTransaction();
+    try {
+      await runner.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
+      const result = await job(new TypeOrmClockPunchRepository(runner.manager));
+      await runner.commitTransaction();
+      return result;
+    } catch (error) {
+      await runner.rollbackTransaction();
+      throw error;
+    } finally {
+      await runner.release();
+    }
+  };
+
+  assert.equal(
+    await inTenantRepo(tenantA, (repo) => repo.insertIfAbsent(punchOf(idIdempotent, tenantA))),
+    true,
+  );
+  assert.equal(
+    await inTenantRepo(tenantA, (repo) => repo.insertIfAbsent(punchOf(idIdempotent, tenantA))),
+    false,
+    "el reintento con el mismo id no inserta",
+  );
+  const stored = await inTenantRepo(tenantA, (repo) => repo.findById(idIdempotent));
+  assert.equal(stored?.action, "CHECK_OUT");
+
+  // El id de una fila del tenant B desde el tenant A: no se inserta, no se pisa y no se ve.
+  assert.equal(
+    await inTenantRepo(tenantA, (repo) => repo.insertIfAbsent(punchOf(idB, tenantA))),
+    false,
+  );
+  assert.equal(await inTenantRepo(tenantA, (repo) => repo.findById(idB)), null);
+  const rows = (await migrator.query(
+    `SELECT tenant_id::text AS tenant, count(*) OVER ()::int AS n FROM self_service.clock_punches WHERE id = ANY($1)`,
+    [[idIdempotent, idB]],
+  )) as { tenant: string; n: number }[];
+  assert.equal(rows[0]?.n, 2, "una fila por id: ni duplicado ni pisado");
+  assert.deepEqual(rows.map((row) => row.tenant).sort(), [tenantA, tenantB].sort());
 });

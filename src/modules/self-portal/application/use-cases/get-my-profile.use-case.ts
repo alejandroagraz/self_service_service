@@ -1,14 +1,14 @@
 import { inject, injectable } from "tsyringe";
 
 import { TOKENS } from "../../../../shared/container/tokens";
-import type { IClock } from "../../../../shared/domain/services/clock.interface";
 import type { ILogger } from "../../../../shared/domain/services/logger.interface";
 import type { IUnitOfWork } from "../../../../shared/domain/repositories/unit-of-work.interface";
+import { deriveClockState } from "../../domain/services/clock-status";
 import type { IAbsencesClient } from "../ports/absences-client.port";
 import type { IPeopleClient } from "../ports/people-client.port";
-import type { ActiveShiftDto, ITimeClient } from "../ports/time-client.port";
+import type { ITimeClient } from "../ports/time-client.port";
+import type { IWorkSessionClient, WorkSessionDto } from "../ports/work-session-client.port";
 import type { EmployeeSelfProfileDto } from "../dtos/self-portal.dto";
-import { loadOperationalDay, UNKNOWN_ACTIVE_SHIFT } from "./operational-day-state";
 
 const NO_SHIFT = "Sin turno asignado";
 
@@ -17,16 +17,17 @@ const NO_SHIFT = "Sin turno asignado";
  *   - people (PRIMARIO, pass-through del token): resuelve la ficha del empleado por su `userId`,
  *     incluidos los años de servicio (`serviceYears` → `seniorityYears`, GAP-033 §6).
  *   - absences (SECUNDARIO, confianza per-pair): días de vacaciones disponibles.
- *   - time (SECUNDARIO, confianza per-pair): nombre del turno de hoy y asignaciones/parámetros del
- *     día operativo.
- *   - clock_punches (propio, RLS): estado de jornada del día operativo vigente, con la MISMA función
- *     que `GET /me/clock-status` y `POST /me/clock-punch` (`loadOperationalDay`, GAP-003).
+ *   - time (SECUNDARIO, confianza per-pair): nombre del turno de hoy (`active-shift`) y la jornada
+ *     vigente de people (`work-sessions/current`, Lote 4.4B1).
+ *   - clock_punches (propio, RLS): última entrada y última marcación (pausa). `currentClockStatus`
+ *     sale de la MISMA fuente y la MISMA función que `GET /me/clock-status` (`deriveClockState`).
  *
  * El `employeeId` se resuelve SIEMPRE vía people (único dueño del vínculo userId↔empleado) antes de
  * consultar a los hermanos de confianza. Si people falla, el perfil falla (no hay empleado que
  * mostrar). Las fuentes SECUNDARIAS degradan con un `warn` (0 días / "Sin turno asignado") para que un
- * hermano caído no tumbe todo el portal. Sin time, el estado de jornada se calcula sobre el día
- * natural VET (sin asignaciones), igual que con el contrato antiguo de `active-shift`.
+ * hermano caído no tumbe todo el portal. Sin la jornada de people, `currentClockStatus` degrada a
+ * `NOT_STARTED`: el BFF ya no es autoridad de la jornada y no la reconstruye con sus marcaciones (un
+ * `CHECK_IN` sobre una jornada abierta lo rechaza people con 409 y `openSessionId`).
  */
 @injectable()
 export class GetMyProfileUseCase {
@@ -34,32 +35,33 @@ export class GetMyProfileUseCase {
     @inject(TOKENS.PeopleClient) private readonly people: IPeopleClient,
     @inject(TOKENS.AbsencesClient) private readonly absences: IAbsencesClient,
     @inject(TOKENS.TimeClient) private readonly time: ITimeClient,
+    @inject(TOKENS.WorkSessionClient) private readonly workSessions: IWorkSessionClient,
     @inject(TOKENS.UnitOfWork) private readonly uow: IUnitOfWork,
-    @inject(TOKENS.Clock) private readonly clock: IClock,
     @inject(TOKENS.Logger) private readonly log: ILogger,
   ) {}
 
-  async execute(tenantId: string, userBearerToken: string): Promise<EmployeeSelfProfileDto> {
+  async execute(
+    tenantId: string,
+    userId: string,
+    userBearerToken: string,
+  ): Promise<EmployeeSelfProfileDto> {
     // PRIMARIO: si people no resuelve la ficha, el error se propaga (401/403/404/503 ya mapeados).
     const profile = await this.people.getMyProfile(userBearerToken);
+    const employeeId = profile.employeeId;
 
-    const [vacationDaysAvailable, shift] = await Promise.all([
-      this.safeAvailableDays(tenantId, profile.employeeId),
-      this.safeActiveShift(tenantId, profile.employeeId),
+    const [vacationDaysAvailable, shiftName, session] = await Promise.all([
+      this.safeAvailableDays(tenantId, employeeId),
+      this.safeShiftName(tenantId, employeeId),
+      this.safeCurrentWorkSession(tenantId, userId, employeeId),
     ]);
-    const now = this.clock.now();
 
-    const { currentClockStatus, lastClockInAt } = await this.uow.withTenant(
-      tenantId,
-      async (repos) => {
-        const day = await loadOperationalDay(repos, profile.employeeId, now, shift);
-        const lastCheckInAt = await repos.clockPunches.findLastCheckInAt(profile.employeeId);
-        return {
-          currentClockStatus: day.status,
-          lastClockInAt: lastCheckInAt === null ? null : lastCheckInAt.toISOString(),
-        };
-      },
-    );
+    const { lastPunch, lastCheckInAt } = await this.uow.withTenant(tenantId, async (repos) => ({
+      lastPunch: await repos.clockPunches.findLastByEmployee(employeeId),
+      lastCheckInAt: await repos.clockPunches.findLastCheckInAt(employeeId),
+    }));
+    const currentClockStatus =
+      session === undefined ? "NOT_STARTED" : deriveClockState(session, lastPunch).status;
+    const lastClockInAt = lastCheckInAt === null ? null : lastCheckInAt.toISOString();
 
     return {
       employeeId: profile.employeeId,
@@ -76,7 +78,7 @@ export class GetMyProfileUseCase {
       // GAP-033 §6: fuente única en people (`serviceYears`). Sin él, `null`; nunca se recalcula aquí.
       seniorityYears: profile.serviceYears,
       vacationDaysAvailable,
-      activeShiftName: shift.shiftName ?? NO_SHIFT,
+      activeShiftName: shiftName ?? NO_SHIFT,
       currentClockStatus,
       lastClockInAt,
     };
@@ -88,24 +90,47 @@ export class GetMyProfileUseCase {
       const balance = await this.absences.getLeaveBalance(tenantId, employeeId);
       return balance.availableDays;
     } catch {
-      this.log.warn("absences no disponible; se degrada vacationDaysAvailable a 0.", { employeeId });
+      this.log.warn("absences no disponible; se degrada vacationDaysAvailable a 0.", {
+        employeeId,
+      });
       return 0;
     }
   }
 
-  /**
-   * Turno de hoy y asignaciones del día operativo. Si time no responde se degrada a
-   * `UNKNOWN_ACTIVE_SHIFT`: "Sin turno asignado" y estado de jornada sobre el día natural VET.
-   */
-  private async safeActiveShift(tenantId: string, employeeId: string): Promise<ActiveShiftDto> {
+  /** Nombre del turno de hoy; `null` ("Sin turno asignado") si time no responde. */
+  private async safeShiftName(tenantId: string, employeeId: string): Promise<string | null> {
     try {
-      return await this.time.getActiveShift(tenantId, employeeId);
+      return (await this.time.getActiveShift(tenantId, employeeId)).shiftName;
+    } catch {
+      this.log.warn("time no disponible; se degrada activeShiftName a 'Sin turno asignado'.", {
+        employeeId,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Jornada vigente de people (`null` = sin jornada). `undefined` si people no responde: el estado de
+   * jornada degrada a `NOT_STARTED` (ver la cabecera).
+   */
+  private async safeCurrentWorkSession(
+    tenantId: string,
+    userId: string,
+    employeeId: string,
+  ): Promise<WorkSessionDto | null | undefined> {
+    try {
+      return await this.workSessions.getCurrentWorkSession(
+        { tenantId, actingUserId: userId },
+        employeeId,
+      );
     } catch {
       this.log.warn(
-        "time no disponible; se degradan activeShiftName y el estado de jornada al día natural.",
-        { employeeId },
+        "jornada de people no disponible; se degrada currentClockStatus a NOT_STARTED.",
+        {
+          employeeId,
+        },
       );
-      return UNKNOWN_ACTIVE_SHIFT;
+      return undefined;
     }
   }
 }

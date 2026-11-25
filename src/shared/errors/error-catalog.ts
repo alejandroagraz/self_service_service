@@ -115,23 +115,41 @@ export const ERRORS = define({
   },
 
   // ===== CLK — clock punches (marcaciones de reloj del empleado, por tenant) =====
+  // Desde el Lote 4.4B1 (GAP-043) la autoridad de la marcación es people: el BFF traduce sus códigos.
+  // Marcación inválida: nota demasiado larga, o `punchedAt` desviado más de 5 min del reloj de people
+  // (`TIMCLK0011`).
   CLOCK_PUNCH_INVALID: {
     code: "SSVCLK0001",
     message: "La marcación de reloj no es válida.",
     statusCode: 422,
   },
-  // La máquina de estados de marcación rechaza la transición (p. ej. CHECK_OUT sin jornada abierta).
+  // people rechaza la secuencia: jornada ya abierta en la misma ventana o en su ventana de avisos
+  // (`TIMCLK0005`, `errors` con `openSessionId` y `abandonAt`) o salida/pausa sin jornada abierta
+  // (`TIMCLK0010`). Los `errors` de people se propagan.
   CLOCK_PUNCH_INVALID_TRANSITION: {
     code: "SSVCLK0002",
     message: "La acción de marcación no es válida para su estado de jornada actual.",
     statusCode: 409,
   },
-  // Entrada (CHECK_IN) fuera de la ventana del turno un día con turno asignado (GAP-003). El detalle
-  // `opensAt` lleva el instante ISO de la próxima apertura (`inicio − ventana previa`) cuando se
-  // conoce; sin turno siguiente en el horizonte, `errors` va vacío.
+  // Entrada antes de la apertura de la ventana del turno (`TIMCLK0006`). El detalle `opensAt` lleva
+  // el instante ISO de la apertura cuando people lo conoce; si no, `errors` va vacío.
   CLOCK_PUNCH_OUTSIDE_SHIFT_WINDOW: {
     code: "SSVCLK0003",
     message: "No se puede marcar la entrada fuera de la ventana de su turno.",
+    statusCode: 409,
+  },
+
+  // ===== SHF — aviso de fin de turno (respuesta del empleado, GAP-043 §4 c) =====
+  // La jornada no existe o no es del empleado autenticado (`TIMCLK0007`); no se distinguen.
+  SHIFT_OVERRUN_SESSION_NOT_FOUND: {
+    code: "SSVSHF0001",
+    message: "La jornada indicada no existe.",
+    statusCode: 404,
+  },
+  // No hay ningún aviso abierto: ya respondido, jornada cerrada o aviso vencido (`TIMCLK0008`).
+  SHIFT_OVERRUN_NOT_OPEN: {
+    code: "SSVSHF0002",
+    message: "No hay ningún aviso de fin de turno pendiente de respuesta en esta jornada.",
     statusCode: 409,
   },
 

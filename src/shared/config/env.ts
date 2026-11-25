@@ -153,6 +153,13 @@ export const env = cleanEnv(withEmptyAsUnset(process.env), {
   TIME_INTERNAL_READ_KEY_FILE: str({
     default: "/run/secrets/self_service_time_internal_key",
   }),
+  // time: clave de ESCRITURA dedicada (Lote 4.4B1, guardian C12) para la marcación síncrona
+  // (`work-sessions/punches`) y la respuesta al aviso de fin de turno (`overrun-answer`). Infra monta
+  // el secreto `people_internal_write_key_self_service` con este nombre. Los GET siguen con la de
+  // lectura.
+  TIME_INTERNAL_WRITE_KEY_FILE: str({
+    default: "/run/secrets/self_service_time_internal_write_key",
+  }),
 
   // documents: descarga de confianza del PDF de un recibo propio (GAP-012), clave per-caller dedicada
   // de self_service. NO reenvía el token del usuario: la pertenencia la verifica el BFF antes.
@@ -188,8 +195,8 @@ export const env = cleanEnv(withEmptyAsUnset(process.env), {
  * Ningún secreto se acepta ya como variable de entorno (rulebook §9.2). `POSTGRES_MIGRATOR_PASSWORD`
  * entra en la lista aunque este fichero no la lea nunca: el runtime se conecta como
  * `app_self_service` y **no debe poder autenticarse como dueño del schema** (§17.1). El contenedor
- * de migración no carga este módulo, de modo que esta comprobación no le afecta. Las cuatro claves
- * per-caller de lectura saliente también se vetan como variable: solo se aceptan por fichero.
+ * de migración no carga este módulo, de modo que esta comprobación no le afecta. Las claves per-caller
+ * salientes (lectura y la de escritura hacia time) también se vetan como variable: solo se aceptan por fichero.
  */
 assertSecretsNotInEnvironment([
   "POSTGRES_APP_PASSWORD",
@@ -198,6 +205,7 @@ assertSecretsNotInEnvironment([
   "PAYROLL_INTERNAL_READ_KEY",
   "ABSENCES_INTERNAL_READ_KEY",
   "TIME_INTERNAL_READ_KEY",
+  "TIME_INTERNAL_WRITE_KEY",
   "DOCUMENTS_INTERNAL_KEY_SELF_SERVICE",
   "POSTGRES_MIGRATOR_PASSWORD",
 ]);
