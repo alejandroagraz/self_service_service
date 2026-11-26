@@ -90,6 +90,8 @@ export interface SubmitOvertimeExceptionRequest {
   readonly startAt: Date;
   readonly endAt: Date;
   readonly justification: string;
+  /** Evidencias ya verificadas contra documents por el BFF (0–5, Lote 4.5A). */
+  readonly evidenceDocumentIds: readonly string[];
 }
 
 /** Lo que el BFF expone del alta (contrato §5: sin `supervisorValidation`). */
@@ -125,6 +127,8 @@ export interface OwnOvertimeRequest {
   readonly supervisorValidation: OwnSupervisorValidation | null;
   readonly decisionReason: string | null;
   readonly createdAt: Date;
+  /** Ids de su evidencia (Lote 4.5A; descarga por `/me/overtime-requests/:id/evidence/:documentId`). */
+  readonly evidenceDocumentIds: readonly string[];
 }
 
 export interface OwnOvertimeRequestsQuery extends PageQuery {
@@ -148,6 +152,8 @@ export interface OvertimeBalance {
   readonly annual: OvertimePeriodBalance;
   readonly effectiveRemainingMinutes: number;
   readonly exceptionRequestsEnabled: boolean;
+  /** Lote 4.5A: ¿exige la empresa al menos una evidencia en las solicitudes excepcionales? */
+  readonly exceptionEvidenceRequired: boolean;
 }
 
 // ── Equipo (supervisor directo) ──
@@ -175,6 +181,8 @@ export interface TeamOvertimeException {
   readonly status: OvertimeRequestStatus;
   readonly supervisorValidation: SupervisorValidation | null;
   readonly createdAt: Date;
+  /** Ids de la evidencia (Lote 4.5A; descarga por `/team/overtime-exceptions/:id/evidence/:documentId`). */
+  readonly evidenceDocumentIds: readonly string[];
 }
 
 export interface TeamOvertimeExceptionsQuery extends PageQuery {
@@ -193,11 +201,30 @@ export interface TeamExceptionValidation {
   readonly supervisorValidation: SupervisorValidation;
 }
 
+/**
+ * Ámbito del acceso a una evidencia (Lote 4.5A §7): `SELF` = el actor es el empleado de la solicitud;
+ * `TEAM` = el actor es su supervisor directo (foto `supervisor_employee_id`).
+ */
+export const EVIDENCE_ACCESS_SCOPES = ["SELF", "TEAM"] as const;
+export type EvidenceAccessScope = (typeof EVIDENCE_ACCESS_SCOPES)[number];
+
+export interface EvidenceAccessQuery {
+  readonly documentId: string;
+  /** Empleado del principal (perfil de people), nunca del cliente. */
+  readonly actorEmployeeId: string;
+  readonly scope: EvidenceAccessScope;
+}
+
+/** people confirma el acceso y devuelve el empleado DUEÑO de la solicitud (para `x-employee-id`). */
+export interface EvidenceAccess {
+  readonly employeeId: string;
+}
+
 export interface IOvertimeClient {
   /**
    * `POST /time/internal/overtime-exceptions` (clave de escritura, 201). Errores: 422 `SSVOVT0001`
-   * (`TIMOVT0001`, con `errors`), 409 `SSVOVT0006`, 422 `SSVOVT0008`, 422 `SSVOVT0011`, 403
-   * `SSVCOM0003` (`TIMCLK0012`), 503 `SSVSLF0002` (resto).
+   * (`TIMOVT0001`, con `errors`), 409 `SSVOVT0006`, 422 `SSVOVT0007` (evidencia obligatoria, 4.5A),
+   * 422 `SSVOVT0008`, 422 `SSVOVT0011`, 403 `SSVCOM0003` (`TIMCLK0012`), 503 `SSVSLF0002` (resto).
    */
   submitException(
     caller: OvertimeCaller,
@@ -229,4 +256,17 @@ export interface IOvertimeClient {
     requestId: string,
     request: ValidateTeamExceptionRequest,
   ): Promise<TeamExceptionValidation>;
+
+  /**
+   * `GET /time/internal/overtime-requests/:id/evidence-access?documentId&actorEmployeeId&scope`
+   * (lectura, con `X-Acting-User-Id`). `SELF`: solicitud ajena, inexistente o sin ese documento →
+   * `TIMOVT0002` 404 → 404 `SSVDOC0001`; actor que no es el usuario → `TIMCLK0012` 403 → 403
+   * `SSVCOM0003`. `TEAM`: no es su equipo o sin el documento → `TIMOVT0010` 403 → 403 `SSVOVT0010`.
+   * Sin distinguir ajena de inexistente (anti-IDOR); cualquier otra cosa → 503.
+   */
+  getEvidenceAccess(
+    caller: OvertimeCaller,
+    requestId: string,
+    query: EvidenceAccessQuery,
+  ): Promise<EvidenceAccess>;
 }

@@ -85,7 +85,7 @@ beforeEach(() => {
   ]);
   h.upstream.payslips.set(OTHER_EMPLOYEE, [payslipRow(OTHER_PAYSLIP, OTHER_DOCUMENT)]);
   h.upstream.documents.clear();
-  h.upstream.documents.set(OWN_DOCUMENT, { status: 200, pdf: PDF });
+  h.upstream.documents.set(OWN_DOCUMENT, { status: 200, pdf: PDF, owner: EMPLOYEE });
   h.upstream.documents.set(OTHER_DOCUMENT, { status: 200, pdf: PDF });
 });
 
@@ -105,7 +105,11 @@ test("200: recibo propio → PDF binario sin envelope, con nombre de descarga y 
   assert.deepEqual(h.upstream.documentsCalls, [
     {
       documentId: OWN_DOCUMENT,
+      // El recibo no filtra por kind (solo las evidencias, M-3).
+      kind: undefined,
       tenantId: TENANT,
+      // C7 (Lote 4.5A): documents exige x-employee-id = el empleado del principal (de people).
+      employeeId: EMPLOYEE,
       serviceName: "self-service",
       apiKey: TEST_SERVICE_KEY,
       // El token del usuario NO viaja a documents (ruta de confianza).

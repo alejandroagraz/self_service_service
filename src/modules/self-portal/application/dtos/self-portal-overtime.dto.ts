@@ -10,6 +10,8 @@
  * requestedMinutes`…) son de people y llegan traducidas (`SSVOVT*`).
  */
 import {
+  ArrayMaxSize,
+  ArrayUnique,
   IsArray,
   IsBoolean,
   IsIn,
@@ -54,11 +56,14 @@ const PERIOD_VALUES = OVERTIME_LIMIT_PERIODS as unknown as string[];
 const RESULT_VALUES = SUPERVISOR_VALIDATION_RESULTS as unknown as string[];
 const ANSWER_VALUES = SUPERVISOR_VALIDATION_ANSWERS as unknown as string[];
 
+/** Máximo de evidencias por solicitud (contrato 4.5A §6/§7: CHECK `cardinality <= 5` en people). */
+export const MAX_EVIDENCE_DOCUMENTS = 5;
+
 const INSTANT_MESSAGE = "debe ser un instante ISO 8601 con zona (Z u offset ±HH:MM).";
 
 // ───────────────────────────── Peticiones ─────────────────────────────
 
-/** Cuerpo de `POST /me/overtime-exceptions` (contrato §2.4, sin `employeeId`). */
+/** Cuerpo de `POST /me/overtime-exceptions` (contrato 4.4B2 §2.4 + evidencias 4.5A §6, sin `employeeId`). */
 export class SubmitOvertimeExceptionRequestDto {
   @IsOptional()
   @IsUUID()
@@ -80,6 +85,19 @@ export class SubmitOvertimeExceptionRequestDto {
   @IsString()
   @Length(10, 2000)
   justification!: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_EVIDENCE_DOCUMENTS)
+  @IsUUID(undefined, { each: true })
+  @ArrayUnique((id: unknown) => (typeof id === "string" ? id.toLowerCase() : id), {
+    message: "evidenceDocumentIds no admite ids repetidos.",
+  })
+  @Doc({
+    description:
+      "Evidencias ya subidas por POST /me/evidence (0–5 uuid, sin repetir). Cada una debe ser una evidencia confirmada del propio empleado (si no, 422 SSVOVT0013). Obligatoria si la empresa lo exige (422 SSVOVT0007).",
+  })
+  evidenceDocumentIds?: string[];
 }
 
 /** Query de `GET /me/overtime-requests`. Cualquier otro parámetro (p. ej. `employeeId`) → 422. */
@@ -260,6 +278,14 @@ export class MyOvertimeRequestDto {
   @IsString()
   @Doc({ format: "date-time" })
   readonly createdAt!: string;
+
+  @IsArray()
+  @IsUUID(undefined, { each: true })
+  @Doc({
+    description:
+      "Evidencias adjuntas (0–5); se descargan por GET /me/overtime-requests/{id}/evidence/{documentId}.",
+  })
+  readonly evidenceDocumentIds!: string[];
 }
 
 /** Saldo de un período con tope. */
@@ -305,6 +331,13 @@ export class MyOvertimeBalanceDto {
   @IsBoolean()
   @Doc({ description: "false si la empresa desactivó las solicitudes excepcionales." })
   readonly exceptionRequestsEnabled!: boolean;
+
+  @IsBoolean()
+  @Doc({
+    description:
+      "true si la empresa exige al menos una evidencia en las solicitudes excepcionales (si no, 422 SSVOVT0007).",
+  })
+  readonly exceptionEvidenceRequired!: boolean;
 }
 
 /** Validación del supervisor completa (bandeja del supervisor directo). */
@@ -370,6 +403,14 @@ export class TeamOvertimeExceptionDto {
   @IsString()
   @Doc({ format: "date-time" })
   readonly createdAt!: string;
+
+  @IsArray()
+  @IsUUID(undefined, { each: true })
+  @Doc({
+    description:
+      "Evidencias adjuntas (0–5); se descargan por GET /team/overtime-exceptions/{id}/evidence/{documentId}.",
+  })
+  readonly evidenceDocumentIds!: string[];
 }
 
 /** Respuesta de `POST /team/overtime-exceptions/:id/validation`. */

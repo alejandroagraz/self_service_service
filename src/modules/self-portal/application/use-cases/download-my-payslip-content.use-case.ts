@@ -38,7 +38,8 @@ export const payslipFilename = (
  *   2. recibos de ese empleado vía payroll interno (la MISMA lista que `GET /me/payslips`);
  *   3. el `payslipId` debe estar en esa lista: si no, 404 sin distinguir "ajeno" de "inexistente"
  *      (anti-IDOR);
- *   4. su `documentId` se descarga de documents por la ruta de confianza, en stream.
+ *   4. su `documentId` se descarga de documents por la ruta de confianza, en stream, con
+ *      `x-employee-id` = el empleado del principal (C7: documents vuelve a comprobar la pertenencia).
  *
  * Un `documentId` vacío (payroll aún no acuñó el PDF) es 409. Nunca se toma un id de documento del
  * cliente: solo el de la fila del propio empleado.
@@ -68,7 +69,12 @@ export class DownloadMyPayslipContentUseCase {
       throw fail("SELF_PAYSLIP_DOCUMENT_PENDING");
     }
 
-    const content = await this.documents.openContent(tenantId, documentId);
+    // C7 (Lote 4.5A): documents exige `x-employee-id` y comprueba que el documento es de ese empleado.
+    const content = await this.documents.openContent(
+      { tenantId, employeeId: profile.employeeId },
+      documentId,
+      { notFound: "SELF_PAYSLIP_NOT_FOUND", pending: "SELF_PAYSLIP_DOCUMENT_PENDING" },
+    );
     return {
       ...content,
       filename: payslipFilename(payslip.periodLabel, payslip.paymentDate, payslip.id),

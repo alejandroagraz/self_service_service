@@ -434,11 +434,77 @@ test("el documento declara el 201 del alta y los códigos SSVOVT de horas extra"
     "SSVOVT0001",
     "SSVOVT0008",
     "SSVOVT0011",
+    "SSVOVT0007",
+    "SSVOVT0013",
   ]);
   const validation = document.paths[`${API}/team/overtime-exceptions/{id}/validation`]
     ?.post as Json;
   assert.deepEqual((codesOf(validation, "403") as Json).enum, ["SSVCOM0003", "SSVOVT0010"]);
   assert.deepEqual((codesOf(validation, "409") as Json).enum, ["SSVOVT0009"]);
+});
+
+test("Lote 4.5A: las respuestas reales de la bóveda, la política y la subida de evidencia tienen la forma documentada", async () => {
+  const documentId = randomUUID();
+  h.upstream.documentsApi.employeeDocuments = pagedData([
+    {
+      id: documentId,
+      kind: "CONTRACT",
+      originalFilename: null,
+      contentType: "application/pdf",
+      sizeBytes: 10,
+      createdAt: "2026-11-20T15:00:00.000Z",
+      sourceService: "manual",
+    },
+  ]);
+  h.upstream.documentsApi.uploadPolicy = okData({
+    maxSizeMb: 10,
+    technicalMaxSizeMb: 25,
+    allowedTypes: [{ type: "pdf", mime: "application/pdf", extensions: [".pdf"] }],
+  });
+  h.upstream.documentsApi.evidence = createdData({
+    documentId,
+    sizeBytes: 9,
+    detectedType: "pdf",
+  });
+  const auth = { authorization: `Bearer ${TOKEN}` };
+
+  const list = await h.app.inject({ method: "GET", url: `${API}/me/documents`, headers: auth });
+  assert.equal(list.statusCode, 200);
+  assertShape(list.json(), okSchemaOf("GET", `${API}/me/documents`), "me/documents");
+  const listSchema = (okSchemaOf("GET", `${API}/me/documents`).properties as Record<string, Json>)
+    .data;
+  assertShape(list.json().data[0], listSchema.items as Json, "me/documents[]");
+
+  const policy = await h.app.inject({
+    method: "GET",
+    url: `${API}/me/documents/upload-policy`,
+    headers: auth,
+  });
+  assert.equal(policy.statusCode, 200);
+  assertShape(policy.json(), okSchemaOf("GET", `${API}/me/documents/upload-policy`), "policy");
+
+  const evidence = await h.app.inject({
+    method: "POST",
+    url: `${API}/me/evidence`,
+    headers: { ...auth, "content-type": "application/pdf", "x-file-name": "e.pdf" },
+    payload: Buffer.from("%PDF-1.7"),
+  });
+  assert.equal(evidence.statusCode, 201);
+  assertShape(evidence.json(), okSchemaOf("POST", `${API}/me/evidence`, "201"), "evidence");
+
+  // El documento publicado declara el cuerpo binario crudo de la subida.
+  const document = (
+    await h.app.inject({ method: "GET", url: `${API}/docs/openapi.json` })
+  ).json() as { paths: Record<string, Record<string, Json>> };
+  const upload = document.paths[`${API}/me/evidence`]?.post as Json;
+  const content = (upload.requestBody as Json).content as Record<string, Json>;
+  assert.deepEqual(Object.keys(content).sort(), [
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+  ]);
+  assert.deepEqual(content["application/pdf"].schema, { type: "string", format: "binary" });
 });
 
 test("regresión: con el validador de Fastify desactivado, un cuerpo inválido da 422 (no 400)", async () => {

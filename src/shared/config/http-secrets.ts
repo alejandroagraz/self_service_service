@@ -1,14 +1,19 @@
 /**
  * Secretos del rol HTTP (rulebook §10.4, §13).
  *
- * `self_service` es un BFF: su rol HTTP necesita SEIS materiales, todos de 43 chars base64url:
+ * `self_service` es un BFF: su rol HTTP necesita SIETE materiales, todos de 43 chars base64url:
  *   - `internalApiKey` — clave interna de servicio (decisión D1). Función OUTBOUND: self_service se
  *     identifica ante `identity` al validar el token de un usuario.
  *   - `payrollReadKey` / `absencesReadKey` / `timeReadKey` — claves PER-PAIR de lectura SALIENTE
  *     (decisión D2, per-caller). Cada hermano valida a self_service contra SU propia clave dedicada;
  *     self_service presenta la clave correcta a cada uno. El compromiso de una no habilita a otra.
  *   - `documentsReadKey` — clave per-caller de self_service ante `documents` (GAP-012): descarga del PDF
- *     de un recibo YA verificado como propio. Ruta interna `/documents/internal/:id/content`.
+ *     de un recibo YA verificado como propio. Ruta interna `/documents/internal/:id/content`. Desde el
+ *     Lote 4.5A también la bóveda propia del empleado (`/internal/employees/:id/documents`), la política de
+ *     subida (`/internal/upload-policy`) y la descarga de evidencias (siempre con `x-employee-id`, C7).
+ *   - `documentsUploadKey` — clave per-caller de ESCRITURA de self_service ante documents (Lote 4.5A,
+ *     guardian C7, catálogo `TRUSTED_UPLOAD_SERVICES`): subida de evidencias (`/internal/evidence`) y su
+ *     verificación (`/internal/evidence/verify`). Debe ser DISTINTA de `documentsReadKey`.
  *   - `timeWriteKey` — clave per-caller de ESCRITURA de self_service ante people/time (Lote 4.4B1,
  *     guardian C12): solo en los POST de `work-sessions` (marcación y respuesta al aviso). Debe ser
  *     DISTINTA de `timeReadKey`: si coincidieran, el catálogo de escritura no separaría nada.
@@ -33,6 +38,7 @@ export interface HttpSecrets {
   readonly timeReadKey: string;
   readonly documentsReadKey: string;
   readonly timeWriteKey: string;
+  readonly documentsUploadKey: string;
 }
 
 /** Lee y valida una clave de 43 chars base64url; el error NO cita el valor, solo la regla. */
@@ -66,12 +72,24 @@ export const loadHttpSecrets = (): HttpSecrets => {
       env.DOCUMENTS_INTERNAL_KEY_SELF_SERVICE_FILE,
     ),
     timeWriteKey: readServiceKey("TIME_INTERNAL_WRITE_KEY_FILE", env.TIME_INTERNAL_WRITE_KEY_FILE),
+    documentsUploadKey: readServiceKey(
+      "DOCUMENTS_UPLOAD_KEY_SELF_SERVICE_FILE",
+      env.DOCUMENTS_UPLOAD_KEY_SELF_SERVICE_FILE,
+    ),
   };
   if (secrets.timeWriteKey === secrets.timeReadKey) {
     // Sin citar ningún valor: solo la regla incumplida (C12, catálogo de escritura separado).
     throw new Error(
       "TIME_INTERNAL_WRITE_KEY_FILE: la clave de escritura hacia time coincide con la de lectura " +
         "(TIME_INTERNAL_READ_KEY_FILE). Deben ser secretos distintos (platform-secrets.sh).",
+    );
+  }
+  if (secrets.documentsUploadKey === secrets.documentsReadKey) {
+    // Sin citar ningún valor (C7, catálogo de escritura de documents separado del de lectura).
+    throw new Error(
+      "DOCUMENTS_UPLOAD_KEY_SELF_SERVICE_FILE: la clave de escritura hacia documents coincide con la " +
+        "de lectura (DOCUMENTS_INTERNAL_KEY_SELF_SERVICE_FILE). Deben ser secretos distintos " +
+        "(platform-secrets.sh).",
     );
   }
   return secrets;

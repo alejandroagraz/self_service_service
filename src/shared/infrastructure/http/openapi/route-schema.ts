@@ -42,6 +42,11 @@ export interface RouteDocs {
   /** Clave real de `requirePermission`, o `PUBLIC_PERMISSION` / `INTERNAL_PERMISSION`. */
   readonly permission: string;
   readonly body?: DtoClass;
+  /**
+   * Cuerpo BINARIO crudo (no JSON; excluyente con `body`): los media types admitidos van a
+   * `consumes` y el esquema es `string`/`binary` (p. ej. la subida de evidencias, Lote 4.5A).
+   */
+  readonly rawBody?: { readonly contentTypes: readonly [string, ...string[]] };
   readonly querystring?: DtoClass;
   readonly params?: DtoClass;
   /** Cabeceras propias de la ruta (p. ej. `Idempotency-Key`); propiedades en minúsculas. */
@@ -239,6 +244,10 @@ export const routeSchema = (docs: RouteDocs): DocumentedRouteSchema => {
     response[String(status)] = errorEnvelope(status, keys);
   }
 
+  if (docs.body !== undefined && docs.rawBody !== undefined) {
+    throw new Error(`OpenAPI: ${docs.operationId} declara a la vez body y rawBody.`);
+  }
+
   const open = docs.permission === PUBLIC_PERMISSION || docs.permission === INTERNAL_PERMISSION;
   return {
     operationId: docs.operationId,
@@ -249,6 +258,12 @@ export const routeSchema = (docs: RouteDocs): DocumentedRouteSchema => {
     "x-permission": docs.permission,
     ...(docs.permission === INTERNAL_PERMISSION ? { "x-internal": true } : {}),
     ...(docs.body === undefined ? {} : { body: dtoSchema(docs.body) }),
+    ...(docs.rawBody === undefined
+      ? {}
+      : {
+          body: { type: "string", format: "binary" },
+          consumes: [...docs.rawBody.contentTypes],
+        }),
     ...(docs.querystring === undefined ? {} : { querystring: dtoSchema(docs.querystring) }),
     ...(docs.params === undefined ? {} : { params: dtoSchema(docs.params) }),
     ...(docs.headers === undefined ? {} : { headers: dtoSchema(docs.headers) }),

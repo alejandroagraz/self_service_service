@@ -2,6 +2,9 @@
  * Controller HTTP de las horas extra excepcionales del portal (GAP-044, Lote 4.4B2). Delgado (rulebook
  * §7.1): valida query/params/cuerpo con su DTO, invoca el caso de uso y arma el `ResponseDto`.
  *
+ * Lote 4.5A: evidencias en el alta (`evidenceDocumentIds`) y descarga de evidencias de una solicitud
+ * propia o de un subordinado directo.
+ *
  * El `tenantId`/`userId` salen SIEMPRE del principal verificado. Ningún `employeeId` ni
  * `supervisorId` se acepta del cliente: los DTO rechazan cualquier campo o parámetro no declarado
  * (422 `SSVCOM0001`) antes de llamar a people. El Bearer solo se reenvía a people (`/employees/me`)
@@ -17,6 +20,8 @@ import {
   principalOf,
 } from "../../../../../shared/infrastructure/http/middlewares/authentication.middleware";
 import { validateDto } from "../../../../../shared/infrastructure/http/validate-dto";
+import { OvertimeEvidenceParamsDto } from "../../../application/dtos/self-portal-documents.dto";
+import type { EvidenceAccessScope } from "../../../application/ports/overtime-client.port";
 import {
   MyOvertimeRequestsQueryDto,
   SubmitOvertimeExceptionRequestDto,
@@ -29,6 +34,8 @@ import { ListMyOvertimeRequestsUseCase } from "../../../application/use-cases/li
 import { ListTeamOvertimeExceptionsUseCase } from "../../../application/use-cases/list-team-overtime-exceptions.use-case";
 import { SubmitMyOvertimeExceptionUseCase } from "../../../application/use-cases/submit-my-overtime-exception.use-case";
 import { ValidateTeamOvertimeExceptionUseCase } from "../../../application/use-cases/validate-team-overtime-exception.use-case";
+import { DownloadOvertimeEvidenceUseCase } from "../../../application/use-cases/download-overtime-evidence.use-case";
+import { rejectQueryParams, sendDocumentContent } from "./document-content-reply";
 
 /** `page`/`pageSize` ya validados por el DTO (dígitos en rango) → número, o `undefined`. */
 const toPageNumber = (value: string | undefined): number | undefined =>
@@ -47,6 +54,8 @@ export class OvertimePortalController {
     private readonly listTeamOvertimeExceptions: ListTeamOvertimeExceptionsUseCase,
     @inject(ValidateTeamOvertimeExceptionUseCase)
     private readonly validateTeamOvertimeException: ValidateTeamOvertimeExceptionUseCase,
+    @inject(DownloadOvertimeEvidenceUseCase)
+    private readonly downloadOvertimeEvidence: DownloadOvertimeEvidenceUseCase,
   ) {}
 
   async submitException(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
@@ -60,6 +69,7 @@ export class OvertimePortalController {
       startAt: new Date(dto.startAt),
       endAt: new Date(dto.endAt),
       justification: dto.justification,
+      evidenceDocumentIds: (dto.evidenceDocumentIds ?? []).map((id) => id.toLowerCase()),
     });
     return reply
       .status(201)
@@ -140,5 +150,34 @@ export class OvertimePortalController {
       },
     );
     return reply.status(200).send(ok(data, "Validación del supervisor registrada."));
+  }
+
+  /** `GET /me/overtime-requests/:id/evidence/:documentId` (Lote 4.5A §6): evidencia de una solicitud propia. */
+  async myEvidence(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
+    return this.evidence(request, reply, "SELF");
+  }
+
+  /** `GET /team/overtime-exceptions/:id/evidence/:documentId`: evidencia de un subordinado directo. */
+  async teamEvidence(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
+    return this.evidence(request, reply, "TEAM");
+  }
+
+  private async evidence(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    scope: EvidenceAccessScope,
+  ): Promise<FastifyReply> {
+    const principal = principalOf(request);
+    const { id, documentId } = validateDto(OvertimeEvidenceParamsDto, request.params ?? {});
+    rejectQueryParams(request);
+    const content = await this.downloadOvertimeEvidence.execute({
+      tenantId: principal.tenantId,
+      userId: principal.userId,
+      userBearerToken: bearerOf(request),
+      requestId: id.toLowerCase(),
+      documentId: documentId.toLowerCase(),
+      scope,
+    });
+    return sendDocumentContent(reply, content);
   }
 }

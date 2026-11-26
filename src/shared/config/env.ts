@@ -167,6 +167,19 @@ export const env = cleanEnv(withEmptyAsUnset(process.env), {
   DOCUMENTS_INTERNAL_KEY_SELF_SERVICE_FILE: str({
     default: "/run/secrets/documents_internal_key_self_service",
   }),
+  // documents: clave de ESCRITURA dedicada (Lote 4.5A, guardian C7) para la subida de evidencias de
+  // horas extra (`/internal/evidence`) y su verificación (`/internal/evidence/verify`). Distinta de la
+  // de lectura (fail-fast en `http-secrets.ts`).
+  DOCUMENTS_UPLOAD_KEY_SELF_SERVICE_FILE: str({
+    default: "/run/secrets/documents_upload_key_self_service",
+  }),
+  // Plazo de la subida en stream de una evidencia a documents (hasta 25 MB a la velocidad del cliente):
+  // cubre el envío del cuerpo completo, no solo las cabeceras como `UPSTREAM_TIMEOUT_MS`. Cadena de
+  // plazos (guardian C-1): Traefik 180 s ≥ `requestTimeout` del BFF 170 s ≥ este 165 s ≥ documents 150 s.
+  DOCUMENTS_UPLOAD_TIMEOUT_MS: strictIntAtLeast(
+    1_000,
+    "Es el plazo total de la subida en stream de una evidencia a documents en MILISEGUNDOS.",
+  )({ default: 165_000 }),
 
   // ===== Rate limiting global (rulebook §10.1) =====
   GLOBAL_RATE_LIMIT_MAX: rateLimitMax({ default: 300 }),
@@ -207,6 +220,7 @@ assertSecretsNotInEnvironment([
   "TIME_INTERNAL_READ_KEY",
   "TIME_INTERNAL_WRITE_KEY",
   "DOCUMENTS_INTERNAL_KEY_SELF_SERVICE",
+  "DOCUMENTS_UPLOAD_KEY_SELF_SERVICE",
   "POSTGRES_MIGRATOR_PASSWORD",
 ]);
 

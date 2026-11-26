@@ -30,6 +30,7 @@ import { loadHttpSecrets } from "../../config/http-secrets";
 import { registerIdentityClient, registerOutboundClients } from "../../container";
 import { childLogger } from "../../logger/logger";
 import { contextLogger } from "../services/winston-logger";
+import { registerDocumentsPortalRoutes } from "../../../modules/self-portal/infrastructure/http/routes/documents-portal.routes";
 import { registerOvertimePortalRoutes } from "../../../modules/self-portal/infrastructure/http/routes/overtime-portal.routes";
 import { registerSelfPortalRoutes } from "../../../modules/self-portal/infrastructure/http/routes/self-portal.routes";
 import { registerAuthentication } from "./middlewares/authentication.middleware";
@@ -41,6 +42,13 @@ import { ipRateLimitKey } from "./middlewares/rate-limit/rate-limit-keys";
 import { createRateLimitStore } from "./middlewares/rate-limit/rate-limit-store";
 
 export const API_PREFIX = "/api/v1/self-service";
+
+/**
+ * Plazo máximo para recibir una petición COMPLETA (cabeceras y cuerpo), en ms. Sin él (Fastify: 0) una
+ * subida de evidencia lenta quedaría colgada en el BFF. Cadena de plazos (guardian C-1): Traefik 180 s
+ * ≥ este 170 s ≥ `DOCUMENTS_UPLOAD_TIMEOUT_MS` 165 s ≥ documents 150 s.
+ */
+export const REQUEST_TIMEOUT_MS = 170_000;
 
 const log = childLogger("fastify");
 
@@ -87,6 +95,7 @@ export const buildHttpApp = async (options: HttpAppOptions = {}): Promise<Fastif
     // desde el socket. Con `true` sería el valor más a la izquierda de `X-Forwarded-For`.
     trustProxy: env.TRUSTED_PROXY_IPS,
     bodyLimit: 256 * 1024,
+    requestTimeout: REQUEST_TIMEOUT_MS,
     logController: new LogController({ disableRequestLogging: true }),
     // URL mala, parámetro demasiado largo y restricción asíncrona: sin esto el router los responde
     // con su propio JSON, sin `code` del catálogo (ver `error-handler.ts`).
@@ -146,6 +155,7 @@ export const buildHttpApp = async (options: HttpAppOptions = {}): Promise<Fastif
     async (scope) => {
       registerSelfPortalRoutes(scope);
       registerOvertimePortalRoutes(scope);
+      registerDocumentsPortalRoutes(scope);
       registerOpenapiDocumentRoute(scope, openapi);
     },
     { prefix: API_PREFIX },

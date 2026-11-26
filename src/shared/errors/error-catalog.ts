@@ -194,6 +194,43 @@ export const ERRORS = define({
     statusCode: 422,
   },
 
+  // La empresa exige evidencia para las solicitudes excepcionales y no se adjuntó ninguna (`TIMOVT0007`).
+  OVERTIME_EVIDENCE_REQUIRED: {
+    code: "SSVOVT0007",
+    message: "Debe adjuntar al menos una evidencia para solicitar horas extra excepcionales.",
+    statusCode: 422,
+  },
+  // Lote 4.5A: alguna evidencia adjunta no es una evidencia confirmada del propio empleado (documents
+  // `verify`). `errors` lleva un `{ field: "evidenceDocumentIds", issue: "<id>" }` por id inválido.
+  OVERTIME_EVIDENCE_INVALID: {
+    code: "SSVOVT0013",
+    message: "Alguna evidencia adjunta no existe o no le pertenece.",
+    statusCode: 422,
+  },
+
+  // ===== DOC — bóveda documental propia y evidencias (Lote 4.5A; autoridad: documents) =====
+  // El documento pedido no está entre los del empleado autenticado (ajeno, inexistente, de un kind no
+  // visible o sin confirmar): no se distingue (anti-IDOR).
+  SELF_DOCUMENT_NOT_FOUND: {
+    code: "SSVDOC0001",
+    message: "El documento solicitado no existe.",
+    statusCode: 404,
+  },
+  // La evidencia supera el límite de subida del tenant (o el techo técnico de 25 MB). `errors` lleva
+  // `{ field: "max_size_mb", issue: "<n>" }` tal como lo da documents.
+  EVIDENCE_TOO_LARGE: {
+    code: "SSVDOC0009",
+    message: "El fichero supera el tamaño máximo permitido.",
+    statusCode: 413,
+  },
+  // El contenido real del fichero (firma) no es un tipo admitido para evidencias, o no coincide con el
+  // declarado. `errors` lleva los tipos admitidos tal como los da documents.
+  EVIDENCE_UNSUPPORTED_TYPE: {
+    code: "SSVDOC0010",
+    message: "Tipo de fichero no admitido para la evidencia.",
+    statusCode: 415,
+  },
+
   // ===== CGR — celebration greetings (felicitaciones sociales del portal, por tenant) =====
   CELEBRATION_GREETING_INVALID: {
     code: "SSVCGR0001",

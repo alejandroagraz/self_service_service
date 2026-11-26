@@ -34,6 +34,7 @@ export const balanceJson = (overrides: Json = {}): Json => ({
   }),
   effectiveRemainingMinutes: 60,
   exceptionRequestsEnabled: true,
+  exceptionEvidenceRequired: true,
   ...overrides,
 });
 
@@ -54,6 +55,7 @@ export const ownItemJson = (overrides: Json = {}): Json => ({
   supervisorValidation: { result: "CONFIRMED", validatedAt: "2026-11-23T12:00:00.000Z" },
   decisionReason: null,
   createdAt: "2026-11-23T01:00:00.000Z",
+  evidenceDocumentIds: [],
   ...overrides,
 });
 
@@ -80,5 +82,6 @@ export const teamItemJson = (overrides: Json = {}): Json => ({
   status: "PENDING_SUPERVISOR_VALIDATION",
   supervisorValidation: null,
   createdAt: "2026-11-23T01:00:00.000Z",
+  evidenceDocumentIds: [],
   ...overrides,
 });

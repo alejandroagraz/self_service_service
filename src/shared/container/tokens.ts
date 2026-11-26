@@ -35,6 +35,7 @@ export const TOKENS = {
   // Horas extra excepcionales de people (GAP-044, Lote 4.4B2): alta y lecturas del empleado, bandeja y
   // validación del supervisor directo. Misma pareja de claves que `WorkSessionClient`.
   OvertimeClient: Symbol.for("IOvertimeClient"),
-  // Descarga de confianza del PDF de un recibo propio (GAP-012), clave per-caller ante documents.
+  // Confianza ante documents: PDF de un recibo propio (GAP-012) y, desde el Lote 4.5A, bóveda propia,
+  // política de subida, evidencias (subida/verificación con clave de escritura) y su descarga.
   DocumentsClient: Symbol.for("IDocumentsClient"),
 } as const;

@@ -7,6 +7,8 @@
  *   GET  {TIME_INTERNAL_URL}/api/v1/time/internal/overtime-balance?employeeId
  *   GET  {TIME_INTERNAL_URL}/api/v1/time/internal/team/overtime-exceptions?status&page&pageSize
  *   POST {TIME_INTERNAL_URL}/api/v1/time/internal/team/overtime-exceptions/:id/validation    (ESCRITURA)
+ *   GET  {TIME_INTERNAL_URL}/api/v1/time/internal/overtime-requests/:id/evidence-access?documentId&actorEmployeeId&scope
+ *        (Lote 4.5A §7, lectura: people confirma el acceso a una evidencia y devuelve el dueño)
  *
  * Cabeceras, claves (C12: escritura en los POST, lectura en los GET), `X-Acting-User-Id` (C13) y
  * fail-closed: núcleo común `time-internal-http.ts`. NO reenvía el token del usuario.
@@ -28,6 +30,8 @@ import {
   SUPERVISOR_VALIDATION_ANSWERS,
   SUPERVISOR_VALIDATION_RESULTS,
   type CategoryMinutes,
+  type EvidenceAccess,
+  type EvidenceAccessQuery,
   type IOvertimeClient,
   type OvertimeBalance,
   type OvertimeCaller,
@@ -82,6 +86,7 @@ const PERIOD_VALUES: ReadonlySet<string> = new Set(OVERTIME_LIMIT_PERIODS);
 const CATEGORY_VALUES: ReadonlySet<string> = new Set(OVERTIME_CATEGORIES);
 const RESULT_VALUES: ReadonlySet<string> = new Set(SUPERVISOR_VALIDATION_RESULTS);
 const ANSWER_VALUES: ReadonlySet<string> = new Set(SUPERVISOR_VALIDATION_ANSWERS);
+const MAX_EVIDENCE_IDS = 5;
 
 // ───────────────────────────── Validación estricta del contrato ─────────────────────────────
 
@@ -120,6 +125,12 @@ const approvedBreakdownOf = (value: unknown, field: string): CategoryMinutes[] |
           minutes: minutes > 0 ? minutes : broken(`${where}.minutes`),
         };
       });
+
+/** Ids de evidencia (Lote 4.5A): lista de uuid (en minúsculas), como mucho 5 (CHECK de people). */
+const evidenceIdsOf = (value: unknown, field: string): string[] => {
+  const ids = arrayOf(value, field).map((id, index) => uuidOf(id, `${field}[${String(index)}]`));
+  return ids.length <= MAX_EVIDENCE_IDS ? ids : broken(field);
+};
 
 /** Validación completa (forma de §2.3): el supervisor la ve en su bandeja. */
 const supervisorValidationOf = (raw: unknown, field: string): SupervisorValidation | null => {
@@ -193,6 +204,7 @@ export const parseOwnRequest = (raw: unknown, field = "data"): OwnOvertimeReques
     ),
     decisionReason: nullableStringOf(r.decisionReason, `${field}.decisionReason`),
     createdAt: instantOf(r.createdAt, `${field}.createdAt`),
+    evidenceDocumentIds: evidenceIdsOf(r.evidenceDocumentIds, `${field}.evidenceDocumentIds`),
   };
 };
 
@@ -215,6 +227,7 @@ export const parseTeamException = (raw: unknown, field = "data"): TeamOvertimeEx
       `${field}.supervisorValidation`,
     ),
     createdAt: instantOf(r.createdAt, `${field}.createdAt`),
+    evidenceDocumentIds: evidenceIdsOf(r.evidenceDocumentIds, `${field}.evidenceDocumentIds`),
   };
 };
 
@@ -241,6 +254,7 @@ export const parseBalance = (raw: unknown): OvertimeBalance => {
       "effectiveRemainingMinutes",
     ),
     exceptionRequestsEnabled: booleanOf(b.exceptionRequestsEnabled, "exceptionRequestsEnabled"),
+    exceptionEvidenceRequired: booleanOf(b.exceptionEvidenceRequired, "exceptionEvidenceRequired"),
   };
 };
 
@@ -285,6 +299,7 @@ const NOT_DIRECT_SUPERVISOR: MappedError = {
 const SUBMIT_ERRORS: Readonly<Record<string, MappedError>> = {
   TIMOVT0001: INVALID,
   TIMOVT0006: { status: 409, key: "OVERTIME_REQUEST_OVERLAP", propagateDetails: false },
+  TIMOVT0007: { status: 422, key: "OVERTIME_EVIDENCE_REQUIRED", propagateDetails: false },
   TIMOVT0008: { status: 422, key: "OVERTIME_EXCEPTIONS_DISABLED", propagateDetails: false },
   TIMOVT0011: { status: 422, key: "OVERTIME_REQUEST_INVALID_SPAN", propagateDetails: false },
   TIMCLK0012: ACTOR_MISMATCH,
@@ -307,6 +322,17 @@ const VALIDATION_ERRORS: Readonly<Record<string, MappedError>> = {
     key: "OVERTIME_REQUEST_INVALID_TRANSITION",
     propagateDetails: false,
   },
+  TIMOVT0010: NOT_DIRECT_SUPERVISOR,
+};
+
+/**
+ * `evidence-access` (Lote 4.5A §7, enmienda del orquestador): SELF ajena/inexistente/sin el documento →
+ * `TIMOVT0002` 404; actor que no es el usuario → `TIMCLK0012` 403; TEAM fuera de su equipo o sin el
+ * documento → `TIMOVT0010` 403. Sin oráculo de existencia en ninguno de los dos ámbitos.
+ */
+const EVIDENCE_ACCESS_ERRORS: Readonly<Record<string, MappedError>> = {
+  TIMOVT0002: { status: 404, key: "SELF_DOCUMENT_NOT_FOUND", propagateDetails: false },
+  TIMCLK0012: ACTOR_MISMATCH,
   TIMOVT0010: NOT_DIRECT_SUPERVISOR,
 };
 
@@ -354,6 +380,7 @@ export class OvertimeClient implements IOvertimeClient {
         startAt: request.startAt.toISOString(),
         endAt: request.endAt.toISOString(),
         justification: request.justification,
+        evidenceDocumentIds: [...request.evidenceDocumentIds],
       },
       successStatus: 201,
       retryTransient: false,
@@ -436,6 +463,38 @@ export class OvertimeClient implements IOvertimeClient {
       retryTransient: false,
       errors: VALIDATION_ERRORS,
       parse: (data) => parseValidation(data, requestId),
+    });
+  }
+
+  async getEvidenceAccess(
+    caller: OvertimeCaller,
+    requestId: string,
+    query: EvidenceAccessQuery,
+  ): Promise<EvidenceAccess> {
+    return this.call({
+      step: "time:getOvertimeEvidenceAccess",
+      method: "GET",
+      url: `${this.baseUrl}${INTERNAL_PATH}/overtime-requests/${encodeURIComponent(requestId)}/evidence-access${queryOf(
+        {
+          documentId: query.documentId,
+          actorEmployeeId: query.actorEmployeeId,
+          scope: query.scope,
+        },
+      )}`,
+      apiKey: this.readKey,
+      caller,
+      errors: EVIDENCE_ACCESS_ERRORS,
+      parse: (data) => {
+        const d = objectOf(data, "data");
+        const employeeId = uuidOf(d.employeeId, "employeeId");
+        // En SELF el dueño ES el actor: otro empleado sería un contrato roto (nunca se descarga).
+        return {
+          employeeId:
+            query.scope === "SELF" && employeeId !== query.actorEmployeeId.toLowerCase()
+              ? broken("employeeId")
+              : employeeId,
+        };
+      },
     });
   }
 

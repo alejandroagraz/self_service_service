@@ -57,6 +57,7 @@ export const toMyOvertimeRequestView = (request: OwnOvertimeRequest): MyOvertime
         },
   decisionReason: request.decisionReason,
   createdAt: request.createdAt.toISOString(),
+  evidenceDocumentIds: [...request.evidenceDocumentIds],
 });
 
 export const toTeamSupervisorValidationView = (
@@ -87,4 +88,5 @@ export const toTeamOvertimeExceptionView = (
       ? null
       : toTeamSupervisorValidationView(exception.supervisorValidation),
   createdAt: exception.createdAt.toISOString(),
+  evidenceDocumentIds: [...exception.evidenceDocumentIds],
 });

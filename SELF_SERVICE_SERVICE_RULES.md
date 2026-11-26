@@ -27,6 +27,12 @@ ruta `/internal/*` ni registra preHandler de "servicio de confianza" entrante.
 | GET | `/api/v1/self-service/me/overtime-balance` | `self_service:read` | people + time (`overtime-balance`) |
 | GET | `/api/v1/self-service/team/overtime-exceptions` | `team:read` | time (`team/overtime-exceptions`) |
 | POST | `/api/v1/self-service/team/overtime-exceptions/:id/validation` | `team:read` | time (`team/overtime-exceptions/:id/validation`, escritura) |
+| GET | `/api/v1/self-service/me/documents` | `self_service:read` | people + documents (`employees/:id/documents`) |
+| GET | `/api/v1/self-service/me/documents/:documentId/content` | `self_service:read` | people + documents (`:id/content`, `x-employee-id`) |
+| GET | `/api/v1/self-service/me/documents/upload-policy` | `self_service:punch` | documents (`upload-policy`) |
+| POST | `/api/v1/self-service/me/evidence` | `self_service:punch` | people + documents (`evidence`, escritura, stream) |
+| GET | `/api/v1/self-service/me/overtime-requests/:id/evidence/:documentId` | `self_service:read` | people + time (`evidence-access`) + documents |
+| GET | `/api/v1/self-service/team/overtime-exceptions/:id/evidence/:documentId` | `team:read` | people + time (`evidence-access`) + documents |
 
 Ruta de red interna (sin autenticación, como `/metrics`; **Traefik debe excluirla** porque cuelga del
 prefijo público): `GET /api/v1/self-service/docs/openapi.json`, el OpenAPI publicado (DEC-16 = A).
@@ -49,7 +55,7 @@ people** (único dueño del vínculo `userId↔empleado`) antes de consultar a l
    secreto `people_internal_write_key_self_service`); el GET (`current`), la de lectura de time. Las
    dos claves deben ser distintas (fail-fast).
 
-Las seis claves (interna de identity + 4 per-pair de lectura + la de escritura hacia time) se leen de Docker secrets al construir
+Las siete claves (interna de identity + 4 per-pair de lectura + las de escritura hacia time y documents) se leen de Docker secrets al construir
 el servidor HTTP (`http-secrets.ts`), 43 chars base64url, fail-fast. Nunca se escriben en logs.
 
 ## Resiliencia de la composición
@@ -116,7 +122,29 @@ el servidor HTTP (`http-secrets.ts`), 43 chars base64url, fail-fast. Nunca se es
   `TIMOVT0011` → 422 `SSVOVT0011`, `TIMCLK0012` → 403 `SSVCOM0003`; caída, código no previsto para la
   ruta o contrato roto → 503 `SSVSLF0002`. Las dos escrituras NO se reintentan (no son idempotentes).
 - El alta responde 201; los listados, `meta` paginada `{ page, pageSize, total, totalPages }`.
-- Sin evidencias (4.5) ni avisos (4.4B3).
+- Sin avisos (4.4B3).
+
+## Bóveda propia y evidencias (Lote 4.5A, contrato `lote-4.5a-contratos.md` §6)
+
+- `DocumentsClient` con DOS claves (C7): lectura (`DOCUMENTS_INTERNAL_KEY_SELF_SERVICE_FILE`: contenido,
+  bóveda, política) y escritura (`DOCUMENTS_UPLOAD_KEY_SELF_SERVICE_FILE` =
+  `/run/secrets/documents_upload_key_self_service`: `evidence` y `evidence/verify`). Distintas (fail-fast).
+- `/internal/:id/content` lleva SIEMPRE `x-employee-id`: el del principal (recibos, bóveda) o el dueño
+  que confirma people (`evidence-access`) en las evidencias, que además piden `?kind=OVERTIME_EVIDENCE`
+  (M-3: una evidencia nunca sirve un documento de otro kind). El `employeeId` nunca sale del cliente.
+- `POST /me/evidence`: binario crudo con parser de paso directo SOLO en el ámbito de esa ruta
+  (`bodyLimit` 25 MB documental); `Content-Length` > 25 MB → 413 sin leer; contador que corta el reenvío
+  a 25 MB; UN solo intento, sin `withTransientRetry` (plazo propio `DOCUMENTS_UPLOAD_TIMEOUT_MS`, 165 s
+  por defecto). Cadena de plazos (guardian C-1): Traefik 180 s ≥ `requestTimeout` de Fastify 170 s ≥
+  subida a documents 165 s ≥ documents 150 s.
+  `X-File-Name` UTF-8 con `%`, validado tras decodificar con el `FILENAME_PATTERN` de documents. Mapeo:
+  413 → `SSVDOC0009`, 415 → `SSVDOC0010` (con `errors`), 422 → `SSVCOM0001`, 429 → `SSVCOM0007`, resto → 503.
+- Alta de excepción con `evidenceDocumentIds` (0–5, sin repetir): `verify` previo; inválidas → 422
+  `SSVOVT0013` (un detalle por id) sin llamar a people; `TIMOVT0007` → 422 `SSVOVT0007`.
+- `evidence-access`: `TIMOVT0002` 404 → 404 `SSVDOC0001`, `TIMCLK0012` → 403 `SSVCOM0003`, `TIMOVT0010`
+  → 403 `SSVOVT0010`; resto → 503. Documento ajeno/inexistente en documents → 404 `SSVDOC0001`.
+- Limitadores por usuario (`createRateLimit`, además del global por IP): 20 subidas/min y 60
+  descargas/min.
 
 ## OpenAPI (DEC-16 = A, modo transitorio)
 

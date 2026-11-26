@@ -42,6 +42,7 @@ export class GetMyOvertimeBalanceUseCase {
       annual: periodView(balance.annual),
       effectiveRemainingMinutes: balance.effectiveRemainingMinutes,
       exceptionRequestsEnabled: balance.exceptionRequestsEnabled,
+      exceptionEvidenceRequired: balance.exceptionEvidenceRequired,
     };
   }
 }

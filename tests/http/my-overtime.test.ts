@@ -136,6 +136,8 @@ test("201: clave de ESCRITURA, X-Acting-User-Id, employeeId del servidor e insta
     startAt: "2026-11-22T22:00:00.000Z",
     endAt: "2026-11-23T00:00:00.000Z",
     justification: VALID_BODY.justification,
+    // Lote 4.5A: la lista de evidencias viaja siempre (vacía si no se adjunta ninguna).
+    evidenceDocumentIds: [],
   });
 });
 

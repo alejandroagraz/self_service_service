@@ -13,6 +13,12 @@
     "GET /api/v1/self-service/me/overtime-balance",
     "GET /api/v1/self-service/team/overtime-exceptions",
     "POST /api/v1/self-service/team/overtime-exceptions/:id/validation",
+    "GET /api/v1/self-service/me/documents",
+    "GET /api/v1/self-service/me/documents/upload-policy",
+    "GET /api/v1/self-service/me/documents/:documentId/content",
+    "POST /api/v1/self-service/me/evidence",
+    "GET /api/v1/self-service/me/overtime-requests/:id/evidence/:documentId",
+    "GET /api/v1/self-service/team/overtime-exceptions/:id/evidence/:documentId",
     "GET /api/v1/self-service/docs/openapi.json"
   ]
 }

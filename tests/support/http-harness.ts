@@ -8,7 +8,8 @@
  *     `/time/internal/overtime-*` y `/time/internal/team/overtime-exceptions*`, Lote 4.4B2), de payroll
  *     (`/payroll/internal/payslips`), de absences (`/absences/internal/leave-balance`,
  *     `employee-month-absences` y `employee-requests`) y de documents
- *     (`/documents/internal/:id/content`). Los clientes REALES (`IdentityClient`, `PeopleClient`,
+ *     (`/documents/internal/:id/content` y, desde el Lote 4.5A, `evidence`, `evidence/verify`,
+ *     `upload-policy` y `employees/:id/documents`; más `evidence-access` de people). Los clientes REALES (`IdentityClient`, `PeopleClient`,
  *     `TimeClient`, `WorkSessionClient`, `OvertimeClient`, `PayrollClient`, `AbsencesClient`, `DocumentsClient`) le
  *     hablan por red, así que también se prueban su parseo y su mapeo de errores, sin depender de los
  *     servicios reales (que otros agentes están ampliando).
@@ -61,7 +62,10 @@ export const TEST_SERVICE_KEY = "test-key-not-a-secret";
  * comprueban que solo viaja en los POST de `work-sessions`.
  */
 export const TEST_TIME_WRITE_KEY = "test-write-key-not-a-secret";
+/** Clave de relleno de ESCRITURA hacia documents (Lote 4.5A, C7), distinta de la de lectura. */
+export const TEST_DOCUMENTS_UPLOAD_KEY = "test-documents-upload-key-not-a-secret";
 const UPSTREAM_TIMEOUT_MS = 2_000;
+const UPLOAD_TIMEOUT_MS = 10_000;
 
 // ───────────────────────────── Reloj manual ─────────────────────────────
 
@@ -261,8 +265,21 @@ export interface UpstreamState {
   payrollStatus: number | null;
   /** Peticiones recibidas en payroll `internal/payslips`. */
   payrollCalls: { employeeId: string | null; tenantId: string | undefined }[];
-  /** documentId → respuesta de documents `/internal/:id/content` (ausente → 404). */
-  documents: Map<string, { status: number; pdf?: Buffer }>;
+  /**
+   * documentId → respuesta de documents `/internal/:id/content` (ausente → 404). Con `owner`, un
+   * `x-employee-id` distinto responde 404 (C7); `headers` se añaden a la respuesta 200.
+   */
+  documents: Map<
+    string,
+    {
+      status: number;
+      pdf?: Buffer;
+      owner?: string;
+      /** Kind del documento: con `?kind=` distinto, 404 (filtro M-3 de documents). */
+      kind?: string;
+      headers?: Record<string, string>;
+    }
+  >;
   /** Peticiones recibidas en documents `/internal/:id/content` (cabeceras de confianza). */
   documentsCalls: DocumentsCall[];
   /** Respuesta de absences `/internal/employee-month-absences`. */
@@ -271,6 +288,33 @@ export interface UpstreamState {
   absenceRequests: UpstreamResponse;
   /** Peticiones recibidas en absences `employee-month-absences` y `employee-requests`. */
   absencesCalls: AbsencesCall[];
+  /** Respuestas de las rutas internas de documents del Lote 4.5A. */
+  documentsApi: {
+    evidence: UpstreamResponse;
+    verify: UpstreamResponse | ((body: Record<string, unknown>) => UpstreamResponse);
+    uploadPolicy: UpstreamResponse;
+    employeeDocuments: UpstreamResponse;
+  };
+  /** Peticiones recibidas en esas rutas (cabeceras de confianza y cuerpo CRUDO). */
+  documentsApiCalls: DocumentsApiCall[];
+  /** Respuesta de people `GET /time/internal/overtime-requests/:id/evidence-access`. */
+  evidenceAccess:
+    UpstreamResponse | ((requestId: string, query: Record<string, string>) => UpstreamResponse);
+}
+
+export interface DocumentsApiCall {
+  readonly method: string;
+  readonly path: string;
+  readonly query: Readonly<Record<string, string>>;
+  readonly tenantId: string | undefined;
+  readonly serviceName: string | undefined;
+  readonly apiKey: string | undefined;
+  readonly employeeId: string | undefined;
+  readonly fileName: string | undefined;
+  readonly contentType: string | undefined;
+  readonly contentLength: string | undefined;
+  readonly authorization: string | undefined;
+  readonly body: Buffer;
 }
 
 export interface WorkSessionCall {
@@ -304,7 +348,10 @@ export interface TestEmployee {
 
 export interface DocumentsCall {
   readonly documentId: string;
+  /** `?kind=` pedido (M-3), o `undefined` si no viaja. */
+  readonly kind: string | undefined;
   readonly tenantId: string | undefined;
+  readonly employeeId: string | undefined;
   readonly serviceName: string | undefined;
   readonly apiKey: string | undefined;
   readonly authorization: string | undefined;
@@ -326,6 +373,10 @@ const OVERTIME_PATHS = [
 const TEAM_VALIDATION_PATH =
   /^\/api\/v1\/time\/internal\/team\/overtime-exceptions\/([^/]+)\/validation$/;
 const OVERRUN_ANSWER_PATH = /^\/api\/v1\/time\/internal\/work-sessions\/([^/]+)\/overrun-answer$/;
+const EVIDENCE_ACCESS_PATH =
+  /^\/api\/v1\/time\/internal\/overtime-requests\/([^/]+)\/evidence-access$/;
+const DOCUMENTS_INTERNAL = "/api/v1/documents/internal";
+const EMPLOYEE_DOCUMENTS_PATH = /^\/api\/v1\/documents\/internal\/employees\/([^/]+)\/documents$/;
 
 const send = (res: ServerResponse, status: number, body: unknown): void => {
   res.writeHead(status, { "content-type": "application/json" });
@@ -362,7 +413,51 @@ const parseBody = (rawBody: string): Record<string, unknown> | null => {
 };
 
 const isOvertimePath = (pathname: string): boolean =>
-  OVERTIME_PATHS.includes(pathname) || TEAM_VALIDATION_PATH.test(pathname);
+  OVERTIME_PATHS.includes(pathname) ||
+  TEAM_VALIDATION_PATH.test(pathname) ||
+  EVIDENCE_ACCESS_PATH.test(pathname);
+
+/** Rutas internas de documents del Lote 4.5A (todas salvo `/:id/content`). */
+const handleDocumentsApi = (
+  state: UpstreamState,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  rawBody: Buffer,
+): boolean => {
+  const route = `${req.method ?? "GET"} ${url.pathname}`;
+  let response: UpstreamResponse | undefined;
+  if (route === `POST ${DOCUMENTS_INTERNAL}/evidence`) {
+    response = state.documentsApi.evidence;
+  } else if (route === `POST ${DOCUMENTS_INTERNAL}/evidence/verify`) {
+    const { verify } = state.documentsApi;
+    response =
+      typeof verify === "function" ? verify(parseBody(rawBody.toString("utf8")) ?? {}) : verify;
+  } else if (route === `GET ${DOCUMENTS_INTERNAL}/upload-policy`) {
+    response = state.documentsApi.uploadPolicy;
+  } else if (req.method === "GET" && EMPLOYEE_DOCUMENTS_PATH.test(url.pathname)) {
+    response = state.documentsApi.employeeDocuments;
+  }
+  if (response === undefined) {
+    return false;
+  }
+  state.documentsApiCalls.push({
+    method: req.method ?? "GET",
+    path: url.pathname,
+    query: Object.fromEntries(url.searchParams.entries()),
+    tenantId: headerOf(req, "x-tenant-id"),
+    serviceName: headerOf(req, "x-service-name"),
+    apiKey: headerOf(req, "x-internal-api-key"),
+    employeeId: headerOf(req, "x-employee-id"),
+    fileName: headerOf(req, "x-file-name"),
+    contentType: headerOf(req, "content-type"),
+    contentLength: headerOf(req, "content-length"),
+    authorization: headerOf(req, "authorization"),
+    body: rawBody,
+  });
+  send(res, response.status, response.body);
+  return true;
+};
 
 const handleOvertime = (
   state: UpstreamState,
@@ -375,6 +470,7 @@ const handleOvertime = (
   const { overtime } = state;
   const route = `${req.method ?? "GET"} ${url.pathname}`;
   const validationMatch = TEAM_VALIDATION_PATH.exec(url.pathname);
+  const evidenceMatch = EVIDENCE_ACCESS_PATH.exec(url.pathname);
   let response: UpstreamResponse | undefined;
   if (route === `POST ${OVERTIME_PATHS[0]}`) {
     response = overtime.submit;
@@ -390,6 +486,12 @@ const handleOvertime = (
       typeof overtime.validation === "function"
         ? overtime.validation(requestId, body ?? {})
         : overtime.validation;
+  } else if (req.method === "GET" && evidenceMatch !== null) {
+    const requestId = decodeURIComponent(evidenceMatch[1]);
+    response =
+      typeof state.evidenceAccess === "function"
+        ? state.evidenceAccess(requestId, Object.fromEntries(url.searchParams.entries()))
+        : state.evidenceAccess;
   }
   if (response === undefined) {
     send(res, 404, { success: false, code: "NOTFOUND", data: null });
@@ -443,14 +545,18 @@ const handle = (
   state: UpstreamState,
   req: IncomingMessage,
   res: ServerResponse,
-  rawBody: string,
+  rawBytes: Buffer,
 ): void => {
+  const rawBody = rawBytes.toString("utf8");
   const url = new URL(req.url ?? "/", "http://upstream.test");
   state.allCalls.push({
     method: req.method ?? "GET",
     path: url.pathname,
     apiKey: headerOf(req, "x-internal-api-key"),
   });
+  if (handleDocumentsApi(state, req, res, url, rawBytes)) {
+    return;
+  }
   if (isOvertimePath(url.pathname)) {
     handleOvertime(state, req, res, url, parseBody(rawBody));
     return;
@@ -556,15 +662,22 @@ const handle = (
   const documentMatch = DOCUMENT_CONTENT_PATH.exec(url.pathname);
   if (documentMatch !== null) {
     const documentId = decodeURIComponent(documentMatch[1]);
+    const kindFilter = url.searchParams.get("kind") ?? undefined;
     state.documentsCalls.push({
       documentId,
+      kind: kindFilter,
       tenantId: headerOf(req, "x-tenant-id"),
+      employeeId: headerOf(req, "x-employee-id"),
       serviceName: headerOf(req, "x-service-name"),
       apiKey: headerOf(req, "x-internal-api-key"),
       authorization: headerOf(req, "authorization"),
     });
     const document = state.documents.get(documentId);
-    if (document === undefined) {
+    if (
+      document === undefined ||
+      (document.owner !== undefined && document.owner !== headerOf(req, "x-employee-id")) ||
+      (kindFilter !== undefined && document.kind !== kindFilter)
+    ) {
       send(res, 404, { success: false, code: "DOCDOC0001", data: null });
       return;
     }
@@ -575,6 +688,7 @@ const handle = (
     res.writeHead(200, {
       "content-type": "application/pdf",
       "content-length": String(document.pdf.length),
+      ...document.headers,
     });
     res.end(document.pdf);
     return;
@@ -624,12 +738,20 @@ export const buildHarness = async (): Promise<Harness> => {
     monthAbsences: { status: 200, body: { success: true, data: [] } },
     absenceRequests: { status: 200, body: { success: true, data: [] } },
     absencesCalls: [],
+    documentsApi: {
+      evidence: UNAVAILABLE,
+      verify: UNAVAILABLE,
+      uploadPolicy: UNAVAILABLE,
+      employeeDocuments: UNAVAILABLE,
+    },
+    documentsApiCalls: [],
+    evidenceAccess: UNAVAILABLE,
   };
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
-      handle(upstream, req, res, Buffer.concat(chunks).toString("utf8"));
+      handle(upstream, req, res, Buffer.concat(chunks));
     });
   });
   await new Promise<void>((resolve) => {
@@ -673,7 +795,13 @@ export const buildHarness = async (): Promise<Harness> => {
   );
   container.registerInstance(
     TOKENS.DocumentsClient,
-    new DocumentsClient(baseUrl, key, UPSTREAM_TIMEOUT_MS),
+    new DocumentsClient(
+      baseUrl,
+      key,
+      TEST_DOCUMENTS_UPLOAD_KEY,
+      UPSTREAM_TIMEOUT_MS,
+      UPLOAD_TIMEOUT_MS,
+    ),
   );
 
   const app = await buildHttpApp();

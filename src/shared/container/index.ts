@@ -70,7 +70,8 @@ export const registerIdentityClient = (
  * `documents` son de confianza per-pair, cada uno con SU clave dedicada. `WorkSessionClient` (jornada
  * de time, Lote 4.4B1) lleva DOS: la de lectura de time en el GET y la de escritura en los POST (C12);
  * `OvertimeClient` (horas extra excepcionales, Lote 4.4B2) reutiliza esa misma pareja con la misma
- * regla (lecturas con la de lectura, las dos escrituras con la de escritura). Todos comparten el timeout de
+ * regla (lecturas con la de lectura, las dos escrituras con la de escritura). `DocumentsClient` (Lote
+ * 4.5A, C7) lleva también DOS: lectura (contenido, bóveda, política) y escritura (evidencias). Todos comparten el timeout de
  * upstream (en `documents`, hasta recibir las cabeceras: el cuerpo fluye en stream).
  *
  * `PeopleInternalClient` es el canal trusted-service hacia people (`/api/v1/people/internal/*`:
@@ -125,7 +126,9 @@ export const registerOutboundClients = (secrets: HttpSecrets): void => {
     new DocumentsClient(
       env.DOCUMENTS_INTERNAL_URL,
       secrets.documentsReadKey,
+      secrets.documentsUploadKey,
       env.UPSTREAM_TIMEOUT_MS,
+      env.DOCUMENTS_UPLOAD_TIMEOUT_MS,
     ),
   );
 };
