@@ -1,5 +1,5 @@
 # =====================================================================================================
-# PLANTILLA — build-testing.yml (GitHub Actions → GHCR → dispatch a fibex-infra → runner en la VPS)
+# PLANTILLA — build-testing.yml (GitHub Actions → GHCR → workflow_dispatch en fibex-infra → runner en la VPS)
 #
 # Se copia a `.github/workflows/build-testing.yml` de CADA repo de aplicación (los 7 backends y
 # frontend_rrhh). Las copias por repo las genera `workflows/render.sh`. Cambian 3 valores (bloque `env`):
@@ -10,8 +10,9 @@
 # Qué hace:
 #   push a develop → build multi-stage (`--target runtime`) y, en backends, también la imagen de seed
 #   (`--target build`), con caché de BuildKit en GitHub Actions (type=gha) → push a GHCR con tags
-#   `testing`, `develop`, `sha-<12>` y `testing-seed`, `sha-<12>-seed` → `repository_dispatch`
-#   `deploy-testing` a fibex-infra. El despliegue lo hace el runner autoalojado de fibex-infra DENTRO de
+#   `testing`, `develop`, `sha-<12>` y `testing-seed`, `sha-<12>-seed` → retención en GHCR → lanza el
+#   workflow `deploy-testing.yml` de fibex-infra (workflow_dispatch sobre `develop`). El despliegue lo
+#   hace el runner autoalojado de fibex-infra DENTRO de
 #   la VPS (el SSH de la VPS no es accesible desde internet). Agrupación de merges (45 s), concurrencia y
 #   flock viven en fibex-infra.
 #   workflow_dispatch → lo mismo; `deploy` desactiva el disparo.
@@ -20,9 +21,20 @@
 #
 # Secreto del repo (Settings → Secrets and variables → Actions; guía en fibex-infra/docs/deploy-testing-vps.md):
 #   INFRA_DISPATCH_TOKEN  Fine-grained PAT acotado SOLO al repo alejandroagraz/fibex-infra, con
-#                         «Contents: Read and write» (lo exige POST /repos/{owner}/{repo}/dispatches).
+#                         «Actions: Read and write» (+ Metadata: Read). NADA de Contents: el token puede
+#                         lanzar workflows pero nunca modificar ficheros ni scripts del repo.
 # Sin INFRA_DISPATCH_TOKEN se publica la imagen y el disparo se omite con un aviso (exit 0).
-# El push a GHCR usa el GITHUB_TOKEN del propio workflow (permiso packages: write).
+# El push a GHCR y la retención usan el GITHUB_TOKEN del propio workflow (permiso packages: write).
+#
+# RETENCIÓN EN GHCR (2 GB de Packages en GitHub Pro). Tras publicar, en el paquete de este repo:
+#   - se conservan SIEMPRE las versiones con `testing`, `testing-seed`, `develop` o cualquier tag que no
+#     sea `sha-*` (nunca se borra lo que este workflow no gestiona);
+#   - de los `sha-<12>` y `sha-<12>-seed` se conservan los N más recientes de cada tipo (variable del
+#     repo GHCR_KEEP_SHA_VERSIONS, por defecto 3) para poder hacer rollback;
+#   - se borran las versiones sin tag (huérfanas) con más de 30 min y que ninguna versión conservada
+#     referencie (hijas de un índice multi-plataforma);
+#   - GHCR_RETENTION_DRY_RUN=true solo lista lo que borraría.
+#   Si falla (p. ej. el repo no tiene rol Admin sobre el paquete), avisa y NO rompe el build ni el deploy.
 # =====================================================================================================
 name: build-testing
 
@@ -144,8 +156,79 @@ jobs:
             if [ "${SEED_SUPPORTED}" = "true" ]; then echo "- \`${{ steps.vars.outputs.image }}:testing-seed\`"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Dispara el workflow deploy-testing de fibex-infra (repository_dispatch). No espera al despliegue:
-  # el resultado se ve en las Actions de fibex-infra.
+      # Retención en GHCR (ver cabecera). Nunca falla el job: cualquier problema es un aviso.
+      - name: Retención en GHCR
+        if: ${{ success() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.vars.outputs.image }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          KEEP_SHA: ${{ vars.GHCR_KEEP_SHA_VERSIONS || '3' }}
+          DRY_RUN: ${{ vars.GHCR_RETENTION_DRY_RUN || 'false' }}
+          UNTAGGED_MIN_AGE_S: "1800"
+          MAX_DELETE: "300"
+        run: |
+          set -uo pipefail
+          note() { echo "::warning::Retención GHCR (${IMAGE_NAME}): $*"; }
+          case "${KEEP_SHA}" in ''|*[!0-9]*|0) note "GHCR_KEEP_SHA_VERSIONS='${KEEP_SHA}' no es un entero >= 1; uso 3"; KEEP_SHA=3;; esac
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          scope=users; [ "${OWNER_TYPE}" = "Organization" ] && scope=orgs
+          api="/${scope}/${owner}/packages/container/${IMAGE_NAME}/versions"
+          err="$(mktemp)"
+          if ! all="$(gh api --paginate "${api}?per_page=100" 2>"${err}" | jq -s 'add // []')"; then
+            note "no pude listar las versiones: $(tr '\n' ' ' < "${err}" | head -c 300). ¿Tiene este repo el rol Admin en el paquete? (Package settings → Manage Actions access)"
+            exit 0
+          fi
+          # tagged a borrar: TODOS sus tags son sha-* y ninguno está entre los N más recientes de su tipo.
+          plan="$(jq -c --argjson keep "${KEEP_SHA}" --argjson now "$(date +%s)" --argjson age "${UNTAGGED_MIN_AGE_S}" '
+            def tags: (.metadata.container.tags // []);
+            (sort_by(.created_at) | reverse) as $v
+            | ([$v[] | tags[] | select(test("^sha-[0-9a-f]+$"))] | .[:$keep]) as $sha
+            | ([$v[] | tags[] | select(test("^sha-[0-9a-f]+-seed$"))] | .[:$keep]) as $seed
+            | ($sha + $seed) as $keepsha
+            | def old_sha: (tags | length) > 0
+                and all(tags[]; test("^sha-[0-9a-f]+(-seed)?$"))
+                and ([tags[] | select(. as $t | $keepsha | index($t))] | length) == 0;
+            { keep:     [$v[] | select((tags | length) > 0 and (old_sha | not)) | .name],
+              tagged:   [$v[] | select(old_sha) | {id, name, t: (tags | join(","))}],
+              untagged: [$v[] | select((tags | length) == 0
+                                and (.created_at | fromdateiso8601) < ($now - $age)) | {id, name, t: "<sin tag>"}],
+              total: ($v | length) }' <<< "${all}")" || { note "no pude calcular el plan"; exit 0; }
+          # Hijas (plataformas/attestations) de las versiones conservadas: nunca se borran.
+          refs=""
+          for d in $(jq -r '.keep[]' <<< "${plan}"); do
+            raw="$(docker buildx imagetools inspect --raw "${IMAGE}@${d}" 2>/dev/null)" || continue
+            refs="${refs}$(jq -r '.manifests[]?.digest' <<< "${raw}" 2>/dev/null)"$'\n'
+          done
+          refs_json="$(printf '%s' "${refs}" | jq -R -s 'split("\n") | map(select(length > 0))')"
+          todo="$(jq -c --argjson refs "${refs_json}" --argjson max "${MAX_DELETE}" \
+            '(.tagged + [.untagged[] | select(.name as $n | $refs | index($n) | not)]) | .[:$max]' <<< "${plan}")"
+          n="$(jq 'length' <<< "${todo}")"
+          echo "Versiones: $(jq '.total' <<< "${plan}") · conservadas con tag: $(jq '.keep | length' <<< "${plan}") · a borrar: ${n} (sha conservados por tipo: ${KEEP_SHA})"
+          if [ "${DRY_RUN}" = "true" ]; then
+            jq -r '.[] | "  [dry-run] borraría \(.id) \(.t) \(.name)"' <<< "${todo}"; exit 0
+          fi
+          ok=0; fail=0
+          while IFS=$'\t' read -r id t; do
+            [ -n "${id}" ] || continue
+            if gh api -X DELETE "${api}/${id}" >/dev/null 2>"${err}"; then
+              ok=$((ok + 1)); echo "  borrada ${id} (${t})"
+            else
+              fail=$((fail + 1)); note "no pude borrar ${id} (${t}): $(tr '\n' ' ' < "${err}" | head -c 200)"
+              # Sin permiso no tiene sentido seguir intentándolo con el resto.
+              if grep -qiE '403|404|permission|not found' "${err}"; then
+                note "¿Tiene este repo el rol Admin en el paquete? (Package settings → Manage Actions access)"; break
+              fi
+            fi
+          done < <(jq -r '.[] | [(.id | tostring), .t] | @tsv' <<< "${todo}")
+          echo "Retención: ${ok} borradas, ${fail} con error."
+          echo "- Retención GHCR: ${ok} versiones borradas (se conservan testing, testing-seed, develop y ${KEEP_SHA} sha por tipo)" >> "$GITHUB_STEP_SUMMARY"
+
+  # Lanza el workflow deploy-testing.yml de fibex-infra sobre `develop` (workflow_dispatch; el token
+  # solo necesita «Actions: Read and write»). No espera al despliegue: el resultado se ve en las Actions
+  # de fibex-infra. `source` y `sha` son trazabilidad y hacen que fibex-infra aplique la agrupación de 45 s.
   deploy:
     needs: build
     if: ${{ github.event_name == 'push' || inputs.deploy }}
@@ -154,6 +237,8 @@ jobs:
     env:
       INFRA_DISPATCH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
       INFRA_REPO: ${{ vars.INFRA_REPO || 'alejandroagraz/fibex-infra' }}
+      INFRA_WORKFLOW: deploy-testing.yml
+      INFRA_REF: develop
     steps:
       - name: Disparar despliegue en fibex-infra
         shell: bash
@@ -163,23 +248,24 @@ jobs:
             echo "::warning::Sin secret INFRA_DISPATCH_TOKEN: imagen publicada, despliegue no disparado (ver fibex-infra/docs/deploy-testing-vps.md)."
             exit 0
           fi
-          event="deploy-testing"
-          body="$(jq -nc --arg e "$event" --arg src "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" \
-            '{event_type: $e, client_payload: {source: $src, sha: $sha}}')"
+          body="$(jq -nc --arg ref "$INFRA_REF" --arg src "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" \
+            '{ref: $ref, inputs: {source: $src, sha: $sha}}')"
+          url="https://api.github.com/repos/${INFRA_REPO}/actions/workflows/${INFRA_WORKFLOW}/dispatches"
           out="$(mktemp)"
           code="$(curl -sS --retry 3 --retry-delay 5 --max-time 30 -o "$out" -w '%{http_code}' \
-            -X POST "https://api.github.com/repos/${INFRA_REPO}/dispatches" \
+            -X POST "$url" \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${INFRA_DISPATCH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             -d "$body")" || code="000"
-          if [ "$code" != "204" ]; then
-            # 401 = token inválido/caducado; 403/404 = el token no tiene «Contents: Read and write» sobre fibex-infra.
-            echo "::error::GitHub respondió HTTP ${code} al disparar ${event} en ${INFRA_REPO}"
+          if [ "$code" != "204" ] && [ "$code" != "200" ]; then
+            # 401 = token inválido/caducado; 403 = sin «Actions: Read and write»; 404 = el token no incluye
+            # fibex-infra (o no existe el workflow); 422 = la rama o los inputs no existen en fibex-infra.
+            echo "::error::GitHub respondió HTTP ${code} al lanzar ${INFRA_WORKFLOW}@${INFRA_REF} en ${INFRA_REPO}"
             cat "$out" >&2; exit 1
           fi
           {
             echo "### Despliegue disparado"
-            echo "- \`${event}\` en \`${INFRA_REPO}\` (origen \`${GITHUB_REPOSITORY}\` @ \`${GITHUB_SHA::12}\`)"
+            echo "- \`${INFRA_WORKFLOW}\` @ \`${INFRA_REF}\` en \`${INFRA_REPO}\` (origen \`${GITHUB_REPOSITORY}\` @ \`${GITHUB_SHA::12}\`)"
             echo "- Seguimiento: https://github.com/${INFRA_REPO}/actions/workflows/deploy-testing.yml"
           } >> "$GITHUB_STEP_SUMMARY"
