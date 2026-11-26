@@ -1,24 +1,29 @@
 # =====================================================================================================
-# PLANTILLA — build-testing.yml (GitHub Actions → GHCR → Dokploy)
+# PLANTILLA — build-testing.yml (GitHub Actions → GHCR → VPS de testing por SSH)
 #
 # Se copia a `.github/workflows/build-testing.yml` de CADA repo de aplicación (los 7 backends y
-# frontend_rrhh). Las copias ya rellenas por repo están en workflows/<repo>/.github/workflows/; las
-# genera `workflows/render.sh` a partir de esta plantilla. Solo cambian 3 valores (bloque `env`):
+# frontend_rrhh). Las copias por repo las genera `workflows/render.sh`. Cambian 4 valores (bloque `env`):
 #   IMAGE_NAME          fibex-rrhh-<servicio>  (debe coincidir con docker-compose.dokploy.yml)
 #   SEED_SUPPORTED      "true" en backends (stage `build` = imagen de seed), "false" en el frontend
+#   SEED_SERVICE        nombre del seed en vps-deploy.sh (identity, people, ...); vacío en el frontend
 #   VITE_API_BASE_URL   solo lo usa el frontend (build-arg); los backends lo ignoran
 #
 # Qué hace:
-#   push a develop → build multi-stage (`--target runtime`) con caché de BuildKit en GitHub Actions
-#   (type=gha) → push a GHCR con tags `testing`, `develop` y `sha-<12>` → dispara el despliegue en
-#   Dokploy (API `compose.deploy`, o webhook como alternativa).
-#   workflow_dispatch → lo mismo, y opcionalmente la imagen de seed `testing-seed` (with_seed).
+#   push a develop → build multi-stage (`--target runtime`) y, en backends, también la imagen de seed
+#   (`--target build`), con caché de BuildKit en GitHub Actions (type=gha) → push a GHCR con tags
+#   `testing`, `develop`, `sha-<12>` y `testing-seed`, `sha-<12>-seed` → despliegue en la VPS por SSH
+#   (`ssh ... deploy` → fibex-infra/scripts/vps-deploy.sh: flock, git reset a develop, pull, up -d).
+#   El push NO siembra (decisión: seeds solo manuales).
+#   workflow_dispatch → lo mismo; `deploy` desactiva el despliegue y `run_seed` siembra ESTE servicio
+#   tras desplegar (`ssh ... seed <servicio>`).
 #
-# Secrets del repo (Settings → Secrets and variables → Actions):
-#   DOKPLOY_URL         p. ej. http://148.113.178.92:3000 (mejor con HTTPS si el panel tiene dominio)
-#   DOKPLOY_API_KEY     API key de Dokploy (Settings → Profile → API/CLI)
-#   DOKPLOY_COMPOSE_ID  id del Compose en Dokploy
-#   DOKPLOY_WEBHOOK_URL (opcional, alternativa a las 3 anteriores) webhook de despliegue del Compose
+# Secrets del repo (Settings → Secrets and variables → Actions; guía en fibex-infra/docs/deploy-testing-vps.md):
+#   VPS_HOST             IP o nombre de la VPS (148.113.178.92)
+#   VPS_USER             usuario SSH (por defecto ubuntu)
+#   VPS_SSH_PRIVATE_KEY  clave privada ed25519 de CI (su pública va forzada a ci-ssh-entry.sh)
+#   VPS_SSH_KNOWN_HOSTS  salida de `ssh-keyscan -t ed25519 <VPS_HOST>` (verificación del host)
+#   VPS_SSH_PORT         opcional (22)
+# Sin VPS_HOST/VPS_SSH_PRIVATE_KEY se publica la imagen y el despliegue se omite con un aviso.
 # El push a GHCR usa el GITHUB_TOKEN del propio workflow (permiso packages: write): no hace falta PAT.
 # =====================================================================================================
 name: build-testing
@@ -28,33 +33,31 @@ on:
     branches: [develop]
   workflow_dispatch:
     inputs:
-      with_seed:
-        description: "Publicar también la imagen de seed (:testing-seed)"
-        type: boolean
-        default: false
       deploy:
-        description: "Disparar el despliegue en Dokploy al terminar"
+        description: "Desplegar en la VPS de testing al terminar"
         type: boolean
         default: true
+      run_seed:
+        description: "Tras desplegar, ejecutar el seed de este servicio (solo backends)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   packages: write
 
-# CONCURRENCIA (requisito 4). Nivel 1, el run completo por repo y rama: un push nuevo a develop
-# CANCELA el run anterior aún en curso (build o espera de despliegue). Con merges seguidos solo se
-# publica y despliega el último commit; nunca se acumulan builds ni redeploys de commits ya superados.
-# Excepción: un lanzamiento MANUAL solo para publicar la imagen de seed (with_seed=true, deploy=false)
-# va a su propio grupo `-seed`. Así no cancela un build o despliegue de un push a develop en curso, y
-# un push tampoco lo cancela a él.
+# CONCURRENCIA. Nivel 1, el run completo por repo y rama: un push nuevo a develop CANCELA el run
+# anterior aún en curso (build o espera de despliegue). Con merges seguidos solo se publica y despliega
+# el último commit; nunca se acumulan builds ni redeploys de commits ya superados.
 concurrency:
-  group: build-testing-${{ github.repository }}-${{ github.ref }}${{ (github.event_name == 'workflow_dispatch' && inputs.with_seed && !inputs.deploy) && '-seed' || '' }}
+  group: build-testing-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: fibex-rrhh-self-service
   SEED_SUPPORTED: "true"
+  SEED_SERVICE: "self-service"
   VITE_API_BASE_URL: /api/v1
 
 jobs:
@@ -87,7 +90,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Imagen de runtime (la que despliega Dokploy). Una sola plataforma (la VPS es amd64) y sin
+      # Imagen de runtime (la que despliega la VPS). Una sola plataforma (la VPS es amd64) y sin
       # attestations: el manifiesto queda simple y el pull en la VPS no descarga artefactos de más.
       - name: Build & push (runtime)
         uses: docker/build-push-action@v6
@@ -115,9 +118,10 @@ jobs:
           cache-from: type=gha,scope=${{ env.IMAGE_NAME }}
           cache-to: type=gha,scope=${{ env.IMAGE_NAME }},mode=max
 
-      # Imagen de seed (stage `build`: devDependencies + dist). Solo a mano y solo en backends.
+      # Imagen de seed (stage `build`: devDependencies + dist). En CADA build de backend, para que
+      # `:testing-seed` nunca vaya por detrás del esquema que migra `:testing`.
       - name: Build & push (seed)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.with_seed && env.SEED_SUPPORTED == 'true' }}
+        if: ${{ env.SEED_SUPPORTED == 'true' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -141,86 +145,70 @@ jobs:
           {
             echo "### Imagen publicada"
             echo "- \`${{ steps.vars.outputs.image }}:testing\`"
-            echo "- \`${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}\` (rollback: \`<SVC>_IMAGE_TAG=sha-${{ steps.vars.outputs.short_sha }}\` en Dokploy)"
+            echo "- \`${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}\` (rollback: \`<SVC>_IMAGE_TAG=sha-${{ steps.vars.outputs.short_sha }}\` en el env de la VPS)"
+            if [ "${SEED_SUPPORTED}" = "true" ]; then echo "- \`${{ steps.vars.outputs.image }}:testing-seed\`"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     needs: build
     if: ${{ github.event_name == 'push' || inputs.deploy }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    # Nivel 2, el despliegue. GitHub limita los grupos de concurrencia a cada repo, así que este grupo
-    # serializa los despliegues de ESTE repo y deja como mucho uno pendiente: un pendiente nuevo
-    # reemplaza al anterior. Entre repos distintos coordina el paso de abajo: espera a que Dokploy
-    # termine el despliegue en curso antes de pedir otro, y Dokploy además encola los de una misma app.
+    # Incluye la espera al candado de la VPS si otro repo está desplegando (vps-deploy.sh usa flock).
+    timeout-minutes: 45
+    # Nivel 2: serializa los despliegues de ESTE repo y deja como mucho uno pendiente. Entre repos
+    # distintos serializa el flock de la VPS; como `pull` trae siempre lo último, un despliegue que
+    # esperó al candado despliega también lo que publicaron los demás repos.
     concurrency:
-      group: dokploy-deploy-testing
+      group: vps-deploy-testing
       cancel-in-progress: false
     env:
       # Ventana para agrupar merges seguidos: si llega otro push a develop en este repo durante la
-      # espera, este run se cancela (nivel 1) y solo despliega el último. Ajustable con la variable
-      # de repo DEPLOY_DEBOUNCE_S.
+      # espera, este run se cancela (nivel 1) y solo despliega el último. Variable de repo
+      # DEPLOY_DEBOUNCE_S.
       DEPLOY_DEBOUNCE_S: ${{ vars.DEPLOY_DEBOUNCE_S || '45' }}
-      # Espera máxima a que termine un despliegue de Dokploy en curso (p. ej. de otro repo).
-      DEPLOY_WAIT_MAX_S: ${{ vars.DEPLOY_WAIT_MAX_S || '600' }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
+      VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+      VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
     steps:
+      - name: Preparar SSH
+        id: ssh
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${VPS_HOST}" ] || [ -z "${VPS_SSH_PRIVATE_KEY}" ]; then
+            echo "::warning::Sin secrets VPS_HOST/VPS_SSH_PRIVATE_KEY: imagen publicada, despliegue omitido (ver fibex-infra/docs/deploy-testing-vps.md)."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "${VPS_SSH_KNOWN_HOSTS}" ]; then
+            echo "::error::Falta el secret VPS_SSH_KNOWN_HOSTS (salida de ssh-keyscan de la VPS): sin él no se verifica la identidad del host."
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${VPS_SSH_PRIVATE_KEY}" > ~/.ssh/fibex_ci && chmod 600 ~/.ssh/fibex_ci
+          printf '%s\n' "${VPS_SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
       - name: Ventana de agrupación (debounce)
+        if: ${{ steps.ssh.outputs.enabled == 'true' && github.event_name == 'push' }}
         shell: bash
         run: sleep "${DEPLOY_DEBOUNCE_S}"
 
-      - name: Disparar despliegue en Dokploy
+      - name: Desplegar en la VPS
+        if: ${{ steps.ssh.outputs.enabled == 'true' }}
         shell: bash
-        env:
-          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
-          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
-          DOKPLOY_COMPOSE_ID: ${{ secrets.DOKPLOY_COMPOSE_ID }}
-          DOKPLOY_WEBHOOK_URL: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
         run: |
           set -euo pipefail
-          # POST con diagnóstico: guarda la respuesta y, si el código no es 2xx, la imprime en stderr
-          # (401 = API key, 400 = composeId o payload, 404 = URL, 5xx = Dokploy). Nunca imprime la API key.
-          post() { # url json [cabeceras curl...]
-            local url="$1" data="$2"; shift 2
-            local out code
-            out="$(mktemp)"
-            code="$(curl -sS --retry 3 --retry-delay 5 --max-time 30 -o "${out}" -w '%{http_code}' \
-              -X POST "${url}" -H "accept: application/json" -H "Content-Type: application/json" \
-              "$@" -d "${data}")" || code="000"
-            if [ "${code#2}" = "${code}" ]; then
-              echo "::error::Dokploy respondió HTTP ${code} a POST ${url%%\?*}" >&2
-              echo "---- respuesta ----" >&2; cat "${out}" >&2; echo >&2; echo "-------------------" >&2
-              rm -f "${out}"; exit 1
-            fi
-            rm -f "${out}"
-            echo "Dokploy HTTP ${code}"
-          }
+          ssh -i ~/.ssh/fibex_ci -p "${VPS_SSH_PORT:-22}" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            "${VPS_USER:-ubuntu}@${VPS_HOST}" deploy
 
-          if [ -n "${DOKPLOY_URL}" ] && [ -n "${DOKPLOY_API_KEY}" ] && [ -n "${DOKPLOY_COMPOSE_ID}" ]; then
-            api="${DOKPLOY_URL%/}/api"
-            # No solapar despliegues en la VPS de 4 GB: si Dokploy está desplegando este Compose (p. ej.
-            # por un push de otro repo), esperar a que termine. Si el estado no se puede leer, se sigue.
-            waited=0; status=""
-            while :; do
-              status="$(curl -fsS --max-time 15 -H "x-api-key: ${DOKPLOY_API_KEY}" \
-                "${api}/compose.one?composeId=${DOKPLOY_COMPOSE_ID}" 2>/dev/null \
-                | jq -r '.composeStatus // empty' 2>/dev/null || true)"
-              [ "${status}" = "running" ] || break
-              if [ "${waited}" -ge "${DEPLOY_WAIT_MAX_S}" ]; then
-                echo "::warning::Dokploy sigue desplegando tras ${waited}s; se encola igualmente."; break
-              fi
-              echo "Dokploy está desplegando (composeStatus=running); espero 20 s..."
-              sleep 20; waited=$((waited + 20))
-            done
-            echo "Dokploy API: compose.deploy (estado previo: ${status:-desconocido})"
-            post "${api}/compose.deploy" "{\"composeId\":\"${DOKPLOY_COMPOSE_ID}\"}" -H "x-api-key: ${DOKPLOY_API_KEY}"
-          elif [ -n "${DOKPLOY_WEBHOOK_URL}" ]; then
-            # El webhook de Dokploy valida la rama del payload estilo GitHub: se envía la del Compose.
-            echo "Dokploy webhook"
-            post "${DOKPLOY_WEBHOOK_URL}" \
-              "{\"ref\":\"refs/heads/develop\",\"after\":\"${GITHUB_SHA}\",\"head_commit\":{\"id\":\"${GITHUB_SHA}\",\"message\":\"${GITHUB_REPOSITORY} sha-${GITHUB_SHA::12}\"},\"commits\":[]}" \
-              -H "X-GitHub-Event: push"
-          else
-            echo "::warning::Sin DOKPLOY_* configurados: no se dispara el despliegue."
-            exit 0
-          fi
-          echo "Despliegue solicitado."
+      - name: Sembrar este servicio
+        if: ${{ steps.ssh.outputs.enabled == 'true' && github.event_name == 'workflow_dispatch' && inputs.run_seed && env.SEED_SERVICE != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/fibex_ci -p "${VPS_SSH_PORT:-22}" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            "${VPS_USER:-ubuntu}@${VPS_HOST}" "seed ${SEED_SERVICE}"
