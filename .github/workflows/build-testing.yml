@@ -2,10 +2,9 @@
 # PLANTILLA — build-testing.yml (GitHub Actions → GHCR → dispatch a fibex-infra → runner en la VPS)
 #
 # Se copia a `.github/workflows/build-testing.yml` de CADA repo de aplicación (los 7 backends y
-# frontend_rrhh). Las copias por repo las genera `workflows/render.sh`. Cambian 4 valores (bloque `env`):
+# frontend_rrhh). Las copias por repo las genera `workflows/render.sh`. Cambian 3 valores (bloque `env`):
 #   IMAGE_NAME          fibex-rrhh-<servicio>  (debe coincidir con docker-compose.dokploy.yml)
 #   SEED_SUPPORTED      "true" en backends (stage `build` = imagen de seed), "false" en el frontend
-#   SEED_SERVICE        nombre del seed en vps-deploy.sh (identity, people, ...); vacío en el frontend
 #   VITE_API_BASE_URL   solo lo usa el frontend (build-arg); los backends lo ignoran
 #
 # Qué hace:
@@ -14,9 +13,10 @@
 #   `testing`, `develop`, `sha-<12>` y `testing-seed`, `sha-<12>-seed` → `repository_dispatch`
 #   `deploy-testing` a fibex-infra. El despliegue lo hace el runner autoalojado de fibex-infra DENTRO de
 #   la VPS (el SSH de la VPS no es accesible desde internet). Agrupación de merges (45 s), concurrencia y
-#   flock viven en fibex-infra. El push NO siembra (decisión: seeds solo manuales).
-#   workflow_dispatch → lo mismo; `deploy` desactiva el disparo y `run_seed` dispara `seed-testing` con
-#   `client_payload.services` = este servicio (fibex-infra despliega y después siembra).
+#   flock viven en fibex-infra.
+#   workflow_dispatch → lo mismo; `deploy` desactiva el disparo.
+#   SEEDS: nunca desde CI (ni push ni botón manual): solo a mano en la VPS. La imagen `:testing-seed`
+#   se sigue publicando para esos seeds manuales.
 #
 # Secreto del repo (Settings → Secrets and variables → Actions; guía en fibex-infra/docs/deploy-testing-vps.md):
 #   INFRA_DISPATCH_TOKEN  Fine-grained PAT acotado SOLO al repo alejandroagraz/fibex-infra, con
@@ -32,13 +32,9 @@ on:
   workflow_dispatch:
     inputs:
       deploy:
-        description: "Disparar el despliegue en la VPS de testing al terminar (con run_seed, fibex-infra despliega igualmente antes de sembrar)"
+        description: "Disparar el despliegue en la VPS de testing al terminar (fibex-infra)"
         type: boolean
         default: true
-      run_seed:
-        description: "Tras desplegar, ejecutar el seed de este servicio (solo backends)"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -47,7 +43,7 @@ permissions:
 # CONCURRENCIA. Nivel 1, el run completo por repo y rama: un push nuevo a develop CANCELA el run
 # anterior aún en curso (build o espera de despliegue). Con merges seguidos solo se publica y despliega
 # el último commit; nunca se acumulan builds ni redeploys de commits ya superados.
-# Los lanzamientos manuales (workflow_dispatch, p. ej. run_seed) van en su propio grupo: un push a
+# Los lanzamientos manuales (workflow_dispatch) van en su propio grupo: un push a
 # develop no los cancela, ni ellos a un push.
 concurrency:
   group: build-testing-${{ github.repository }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && '-manual' || '' }}
@@ -57,7 +53,6 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: fibex-rrhh-self-service
   SEED_SUPPORTED: "true"
-  SEED_SERVICE: "self-service"
   VITE_API_BASE_URL: /api/v1
 
 jobs:
@@ -153,13 +148,12 @@ jobs:
   # el resultado se ve en las Actions de fibex-infra.
   deploy:
     needs: build
-    if: ${{ github.event_name == 'push' || inputs.deploy || inputs.run_seed }}
+    if: ${{ github.event_name == 'push' || inputs.deploy }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
       INFRA_DISPATCH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
       INFRA_REPO: ${{ vars.INFRA_REPO || 'alejandroagraz/fibex-infra' }}
-      RUN_SEED: ${{ github.event_name == 'workflow_dispatch' && inputs.run_seed && 'true' || 'false' }}
     steps:
       - name: Disparar despliegue en fibex-infra
         shell: bash
@@ -169,12 +163,9 @@ jobs:
             echo "::warning::Sin secret INFRA_DISPATCH_TOKEN: imagen publicada, despliegue no disparado (ver fibex-infra/docs/deploy-testing-vps.md)."
             exit 0
           fi
-          event="deploy-testing"; services=""
-          if [ "${RUN_SEED}" = "true" ] && [ -n "${SEED_SERVICE}" ]; then
-            event="seed-testing"; services="${SEED_SERVICE}"
-          fi
+          event="deploy-testing"
           body="$(jq -nc --arg e "$event" --arg src "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" \
-            --arg svc "$services" '{event_type: $e, client_payload: {source: $src, sha: $sha, services: $svc}}')"
+            '{event_type: $e, client_payload: {source: $src, sha: $sha}}')"
           out="$(mktemp)"
           code="$(curl -sS --retry 3 --retry-delay 5 --max-time 30 -o "$out" -w '%{http_code}' \
             -X POST "https://api.github.com/repos/${INFRA_REPO}/dispatches" \
@@ -190,6 +181,5 @@ jobs:
           {
             echo "### Despliegue disparado"
             echo "- \`${event}\` en \`${INFRA_REPO}\` (origen \`${GITHUB_REPOSITORY}\` @ \`${GITHUB_SHA::12}\`)"
-            [ -n "$services" ] && echo "- Seed: \`${services}\`"
             echo "- Seguimiento: https://github.com/${INFRA_REPO}/actions/workflows/deploy-testing.yml"
           } >> "$GITHUB_STEP_SUMMARY"
