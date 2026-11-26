@@ -8,7 +8,8 @@
  *
  * El `id` determinístico se deriva de la MISMA clave natural que la restricción UNIQUE
  * `uq_celebration_greetings (tenant_id, celebrant_employee_id, celebration_date, author_user_id)`, de
- * modo que re-sembrar es idempotente y jamás choca con la unicidad. `author_name` es un snapshot del
+ * modo que re-sembrar es idempotente; el seeder busca además por esa clave natural para no chocar con
+ * una felicitación real (otro id) creada desde el portal. `author_name` es un snapshot del
  * nombre del autor (como lo resuelve el caso de uso vía people en caliente); `created_at` lo pone el
  * default de la BD.
  */
@@ -21,8 +22,9 @@ export type CelebrationTypeLiteral = "BIRTHDAY" | "WORK_ANNIVERSARY";
 
 /**
  * Catálogo determinístico de felicitaciones por tenant, declarado como datos. Cada celebración la
- * felicitan uno o más autores (índices de empleados CON cuenta: 0–5). `dayOffset` es relativo a HOY
- * (≤ 0) para que el portal muestre felicitaciones recientes. El autor nunca coincide con el celebrante.
+ * felicitan uno o más autores (índices de empleados CON cuenta: 0–6). `dayOffset` es relativo a HOY
+ * (día civil de Caracas, ≤ 0) para que el portal muestre felicitaciones recientes. El autor nunca
+ * coincide con el celebrante.
  */
 export interface GreetingSpec {
   readonly celebrantIndex: number;

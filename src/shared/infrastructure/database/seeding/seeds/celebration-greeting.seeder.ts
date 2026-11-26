@@ -10,7 +10,7 @@ import {
 import type { SeedTenant } from "../fixtures";
 import { buildRoster, type SeedEmployee } from "../roster";
 import type { TenantScopedSeeder } from "../seeder";
-import { addDays, toISODate } from "../time-dates";
+import { addDays, caracasToday, toISODate } from "../time-dates";
 
 /** El autor de una felicitación debe tener cuenta: `celebration_greetings.author_user_id` es NOT NULL. */
 const hasAccount = (e: SeedEmployee): e is AccountEmployee => e.userId !== null;
@@ -20,19 +20,23 @@ const hasAccount = (e: SeedEmployee): e is AccountEmployee => e.userId !== null;
  * catálogo determinístico `GREETING_SPECS`. El celebrante debe estar ACTIVO; cada autor debe estar
  * ACTIVO, tener cuenta y no coincidir con el celebrante.
  *
- * Idempotente por `id` determinístico (alineado con la UNIQUE natural): solo INSERT si no existe.
+ * `dayOffset` es relativo a HOY = día civil de Caracas (no el día UTC, que a partir de las 20:00 de
+ * Caracas ya es mañana). Idempotente por la UNIQUE natural `uq_celebration_greetings` (tenant,
+ * celebrante, fecha, autor), además del `id` determinístico: si el autor ya felicitó esa celebración
+ * desde el portal (otra fila, otro id), el seed no inserta (antes: 23505 y seed abortado).
  */
 export class CelebrationGreetingSeeder implements TenantScopedSeeder {
   async run(dataSource: DataSource, tenant: SeedTenant): Promise<void> {
     const repo = dataSource.getRepository(CelebrationGreetingModel);
     const byIndex = new Map<number, SeedEmployee>(buildRoster(tenant).map((e) => [e.index, e]));
+    const today = caracasToday();
 
     for (const spec of GREETING_SPECS) {
       const celebrant = byIndex.get(spec.celebrantIndex);
       if (!celebrant || celebrant.status !== "ACTIVE") {
         continue;
       }
-      const celebrationDate = toISODate(addDays(new Date(), spec.dayOffset));
+      const celebrationDate = toISODate(addDays(today, spec.dayOffset));
 
       for (const authorIndex of spec.authorIndices) {
         const author = byIndex.get(authorIndex);
@@ -44,7 +48,17 @@ export class CelebrationGreetingSeeder implements TenantScopedSeeder {
         }
 
         const id = celebrationGreetingIdOf(tenant.slug, celebrant.index, celebrationDate, author.index);
-        const existing = await repo.findOne({ where: { id } });
+        const existing = await repo.findOne({
+          where: [
+            { id },
+            {
+              tenantId: tenant.id,
+              celebrantEmployeeId: celebrant.id,
+              celebrationDate,
+              authorUserId: author.userId,
+            },
+          ],
+        });
         if (!existing) {
           await repo.insert(
             buildCelebrationGreeting(tenant, celebrant, author, spec.type, celebrationDate),
