@@ -1,5 +1,5 @@
 # =====================================================================================================
-# PLANTILLA — build-testing.yml (GitHub Actions → GHCR → VPS de testing por SSH)
+# PLANTILLA — build-testing.yml (GitHub Actions → GHCR → dispatch a fibex-infra → runner en la VPS)
 #
 # Se copia a `.github/workflows/build-testing.yml` de CADA repo de aplicación (los 7 backends y
 # frontend_rrhh). Las copias por repo las genera `workflows/render.sh`. Cambian 4 valores (bloque `env`):
@@ -11,20 +11,18 @@
 # Qué hace:
 #   push a develop → build multi-stage (`--target runtime`) y, en backends, también la imagen de seed
 #   (`--target build`), con caché de BuildKit en GitHub Actions (type=gha) → push a GHCR con tags
-#   `testing`, `develop`, `sha-<12>` y `testing-seed`, `sha-<12>-seed` → despliegue en la VPS por SSH
-#   (`ssh ... deploy` → fibex-infra/scripts/vps-deploy.sh: flock, git reset a develop, pull, up -d).
-#   El push NO siembra (decisión: seeds solo manuales).
-#   workflow_dispatch → lo mismo; `deploy` desactiva el despliegue y `run_seed` siembra ESTE servicio
-#   tras desplegar (`ssh ... seed <servicio>`).
+#   `testing`, `develop`, `sha-<12>` y `testing-seed`, `sha-<12>-seed` → `repository_dispatch`
+#   `deploy-testing` a fibex-infra. El despliegue lo hace el runner autoalojado de fibex-infra DENTRO de
+#   la VPS (el SSH de la VPS no es accesible desde internet). Agrupación de merges (45 s), concurrencia y
+#   flock viven en fibex-infra. El push NO siembra (decisión: seeds solo manuales).
+#   workflow_dispatch → lo mismo; `deploy` desactiva el disparo y `run_seed` dispara `seed-testing` con
+#   `client_payload.services` = este servicio (fibex-infra despliega y después siembra).
 #
-# Secrets del repo (Settings → Secrets and variables → Actions; guía en fibex-infra/docs/deploy-testing-vps.md):
-#   VPS_HOST             IP o nombre de la VPS (148.113.178.92)
-#   VPS_USER             usuario SSH (por defecto ubuntu)
-#   VPS_SSH_PRIVATE_KEY  clave privada ed25519 de CI (su pública va forzada a ci-ssh-entry.sh)
-#   VPS_SSH_KNOWN_HOSTS  salida de `ssh-keyscan -t ed25519 <VPS_HOST>` (verificación del host)
-#   VPS_SSH_PORT         opcional (22)
-# Sin VPS_HOST/VPS_SSH_PRIVATE_KEY se publica la imagen y el despliegue se omite con un aviso.
-# El push a GHCR usa el GITHUB_TOKEN del propio workflow (permiso packages: write): no hace falta PAT.
+# Secreto del repo (Settings → Secrets and variables → Actions; guía en fibex-infra/docs/deploy-testing-vps.md):
+#   INFRA_DISPATCH_TOKEN  Fine-grained PAT acotado SOLO al repo alejandroagraz/fibex-infra, con
+#                         «Contents: Read and write» (lo exige POST /repos/{owner}/{repo}/dispatches).
+# Sin INFRA_DISPATCH_TOKEN se publica la imagen y el disparo se omite con un aviso (exit 0).
+# El push a GHCR usa el GITHUB_TOKEN del propio workflow (permiso packages: write).
 # =====================================================================================================
 name: build-testing
 
@@ -34,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       deploy:
-        description: "Desplegar en la VPS de testing al terminar"
+        description: "Disparar el despliegue en la VPS de testing al terminar (con run_seed, fibex-infra despliega igualmente antes de sembrar)"
         type: boolean
         default: true
       run_seed:
@@ -49,8 +47,10 @@ permissions:
 # CONCURRENCIA. Nivel 1, el run completo por repo y rama: un push nuevo a develop CANCELA el run
 # anterior aún en curso (build o espera de despliegue). Con merges seguidos solo se publica y despliega
 # el último commit; nunca se acumulan builds ni redeploys de commits ya superados.
+# Los lanzamientos manuales (workflow_dispatch, p. ej. run_seed) van en su propio grupo: un push a
+# develop no los cancela, ni ellos a un push.
 concurrency:
-  group: build-testing-${{ github.repository }}-${{ github.ref }}
+  group: build-testing-${{ github.repository }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && '-manual' || '' }}
   cancel-in-progress: true
 
 env:
@@ -149,66 +149,47 @@ jobs:
             if [ "${SEED_SUPPORTED}" = "true" ]; then echo "- \`${{ steps.vars.outputs.image }}:testing-seed\`"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Dispara el workflow deploy-testing de fibex-infra (repository_dispatch). No espera al despliegue:
+  # el resultado se ve en las Actions de fibex-infra.
   deploy:
     needs: build
-    if: ${{ github.event_name == 'push' || inputs.deploy }}
+    if: ${{ github.event_name == 'push' || inputs.deploy || inputs.run_seed }}
     runs-on: ubuntu-24.04
-    # Incluye la espera al candado de la VPS si otro repo está desplegando (vps-deploy.sh usa flock).
-    timeout-minutes: 45
-    # Nivel 2: serializa los despliegues de ESTE repo y deja como mucho uno pendiente. Entre repos
-    # distintos serializa el flock de la VPS; como `pull` trae siempre lo último, un despliegue que
-    # esperó al candado despliega también lo que publicaron los demás repos.
-    concurrency:
-      group: vps-deploy-testing
-      cancel-in-progress: false
+    timeout-minutes: 5
     env:
-      # Ventana para agrupar merges seguidos: si llega otro push a develop en este repo durante la
-      # espera, este run se cancela (nivel 1) y solo despliega el último. Variable de repo
-      # DEPLOY_DEBOUNCE_S.
-      DEPLOY_DEBOUNCE_S: ${{ vars.DEPLOY_DEBOUNCE_S || '45' }}
-      VPS_HOST: ${{ secrets.VPS_HOST }}
-      VPS_USER: ${{ secrets.VPS_USER }}
-      VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
-      VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
-      VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+      INFRA_DISPATCH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
+      INFRA_REPO: ${{ vars.INFRA_REPO || 'alejandroagraz/fibex-infra' }}
+      RUN_SEED: ${{ github.event_name == 'workflow_dispatch' && inputs.run_seed && 'true' || 'false' }}
     steps:
-      - name: Preparar SSH
-        id: ssh
+      - name: Disparar despliegue en fibex-infra
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${VPS_HOST}" ] || [ -z "${VPS_SSH_PRIVATE_KEY}" ]; then
-            echo "::warning::Sin secrets VPS_HOST/VPS_SSH_PRIVATE_KEY: imagen publicada, despliegue omitido (ver fibex-infra/docs/deploy-testing-vps.md)."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0
+          if [ -z "${INFRA_DISPATCH_TOKEN}" ]; then
+            echo "::warning::Sin secret INFRA_DISPATCH_TOKEN: imagen publicada, despliegue no disparado (ver fibex-infra/docs/deploy-testing-vps.md)."
+            exit 0
           fi
-          if [ -z "${VPS_SSH_KNOWN_HOSTS}" ]; then
-            echo "::error::Falta el secret VPS_SSH_KNOWN_HOSTS (salida de ssh-keyscan de la VPS): sin él no se verifica la identidad del host."
-            exit 1
+          event="deploy-testing"; services=""
+          if [ "${RUN_SEED}" = "true" ] && [ -n "${SEED_SERVICE}" ]; then
+            event="seed-testing"; services="${SEED_SERVICE}"
           fi
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "${VPS_SSH_PRIVATE_KEY}" > ~/.ssh/fibex_ci && chmod 600 ~/.ssh/fibex_ci
-          printf '%s\n' "${VPS_SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-
-      - name: Ventana de agrupación (debounce)
-        if: ${{ steps.ssh.outputs.enabled == 'true' && github.event_name == 'push' }}
-        shell: bash
-        run: sleep "${DEPLOY_DEBOUNCE_S}"
-
-      - name: Desplegar en la VPS
-        if: ${{ steps.ssh.outputs.enabled == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/fibex_ci -p "${VPS_SSH_PORT:-22}" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
-            "${VPS_USER:-ubuntu}@${VPS_HOST}" deploy
-
-      - name: Sembrar este servicio
-        if: ${{ steps.ssh.outputs.enabled == 'true' && github.event_name == 'workflow_dispatch' && inputs.run_seed && env.SEED_SERVICE != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/fibex_ci -p "${VPS_SSH_PORT:-22}" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
-            "${VPS_USER:-ubuntu}@${VPS_HOST}" "seed ${SEED_SERVICE}"
+          body="$(jq -nc --arg e "$event" --arg src "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" \
+            --arg svc "$services" '{event_type: $e, client_payload: {source: $src, sha: $sha, services: $svc}}')"
+          out="$(mktemp)"
+          code="$(curl -sS --retry 3 --retry-delay 5 --max-time 30 -o "$out" -w '%{http_code}' \
+            -X POST "https://api.github.com/repos/${INFRA_REPO}/dispatches" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${INFRA_DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d "$body")" || code="000"
+          if [ "$code" != "204" ]; then
+            # 401 = token inválido/caducado; 403/404 = el token no tiene «Contents: Read and write» sobre fibex-infra.
+            echo "::error::GitHub respondió HTTP ${code} al disparar ${event} en ${INFRA_REPO}"
+            cat "$out" >&2; exit 1
+          fi
+          {
+            echo "### Despliegue disparado"
+            echo "- \`${event}\` en \`${INFRA_REPO}\` (origen \`${GITHUB_REPOSITORY}\` @ \`${GITHUB_SHA::12}\`)"
+            [ -n "$services" ] && echo "- Seed: \`${services}\`"
+            echo "- Seguimiento: https://github.com/${INFRA_REPO}/actions/workflows/deploy-testing.yml"
+          } >> "$GITHUB_STEP_SUMMARY"
