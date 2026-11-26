@@ -65,7 +65,7 @@ const DEPARTMENTS: ReadonlyArray<{ code: string; name: string }> = [
   { code: "OPE", name: "Operaciones" },
 ];
 
-/** 8 cargos. */
+/** 8 cargos, ordenados de MAYOR a MENOR rango (el índice en el array ES el rango: 0 = Gerente). */
 const POSITIONS: ReadonlyArray<{ code: string; name: string }> = [
   { code: "GER", name: "Gerente" },
   { code: "COO", name: "Coordinador" },
@@ -79,6 +79,111 @@ const POSITIONS: ReadonlyArray<{ code: string; name: string }> = [
 
 /** Número de empleados por tenant. */
 export const ROSTER_SIZE = 40;
+
+/** Índice del Gerente General: ÚNICA raíz del organigrama de cada tenant. */
+const ROOT_INDEX = 0;
+
+/**
+ * Organigrama canónico: una fila por índice de roster → [departamento, cargo, índice del jefe].
+ *
+ * Invariantes (las verifica `assertOrgChart` al construir el roster; romper una lanza):
+ * - una ÚNICA raíz (índice 0, Gerente General); el resto tiene jefe.
+ * - el jefe tiene índice MENOR que su reporte: `people` inserta en orden de índice con la FK
+ *   autorreferente `supervisor_id`, así que el jefe siempre existe ya.
+ * - el jefe está ACTIVE (el organigrama solo pinta activos: un jefe dado de baja crearía raíces).
+ * - el jefe tiene rango ESTRICTAMENTE superior (posición menor en `POSITIONS`); la raíz, como
+ *   Gerente General, está por encima de todos (incluidos los Gerentes de departamento).
+ * - jefe y reporte comparten departamento, salvo los jefes de departamento, que reportan a la raíz.
+ * - `OPE` sigue sin empleados.
+ *
+ * Usuarios ligados (índices 0–6, `SEED_USER_DEFS`): admin = Gerente General; rrhh = Gerente de RRHH;
+ * nomina = Coordinador de Administración; auditoria = Especialista que reporta a la Gerencia
+ * General; supervisor = Supervisor de Administración y jefe DIRECTO de colaborador y colaborador-2fa.
+ */
+const ORG_CHART: ReadonlyArray<readonly [dept: string, position: string, supervisor: number | null]> = [
+  ["ADM", "GER", null], // 0  admin · Gerente General (raíz)
+  ["RHH", "GER", 0], //    1  rrhh · Gerente de RRHH
+  ["ADM", "COO", 0], //    2  nomina · Coordinador de Administración
+  ["ADM", "ESP", 0], //    3  auditoria · Especialista (auditoría interna → Gerencia General)
+  ["ADM", "SUP", 2], //    4  supervisor · Supervisor de Administración
+  ["ADM", "ASI", 4], //    5  colaborador
+  ["ADM", "AUX", 4], //    6  colaborador-2fa
+  ["TEC", "GER", 0], //    7  Gerente de Tecnología
+  ["COM", "GER", 0], //    8  Gerente Comercial
+  ["TEC", "COO", 7], //    9
+  ["COM", "COO", 8], //    10
+  ["RHH", "COO", 1], //    11
+  ["TEC", "SUP", 9], //    12
+  ["COM", "SUP", 10], //   13
+  ["RHH", "SUP", 11], //   14
+  ["TEC", "ESP", 9], //    15
+  ["COM", "ESP", 10], //   16
+  ["RHH", "ESP", 11], //   17
+  ["TEC", "ANL", 12], //   18
+  ["COM", "ANL", 13], //   19
+  ["RHH", "ANL", 14], //   20
+  ["ADM", "ANL", 4], //    21
+  ["TEC", "TEC", 12], //   22
+  ["COM", "TEC", 13], //   23
+  ["ADM", "TEC", 4], //    24
+  ["TEC", "ASI", 12], //   25
+  ["COM", "ASI", 13], //   26
+  ["RHH", "ASI", 14], //   27
+  ["TEC", "AUX", 12], //   28
+  ["COM", "AUX", 13], //   29
+  ["RHH", "AUX", 14], //   30
+  ["TEC", "ANL", 12], //   31
+  ["TEC", "TEC", 12], //   32
+  ["COM", "ASI", 13], //   33
+  ["ADM", "AUX", 4], //    34
+  ["RHH", "ANL", 14], //   35
+  ["TEC", "TEC", 12], //   36  TERMINATED
+  ["COM", "ASI", 13], //   37  TERMINATED
+  ["ADM", "AUX", 4], //    38  TERMINATED
+  ["RHH", "ASI", 14], //   39  TERMINATED
+];
+
+/** Índices dados de baja (los 4 últimos). */
+const isTerminatedIndex = (i: number): boolean => i >= ROSTER_SIZE - 4;
+
+function departmentOf(code: string): { code: string; name: string } {
+  const dept = DEPARTMENTS.find((d) => d.code === code);
+  if (!dept) throw new Error(`roster: departamento desconocido "${code}"`);
+  return dept;
+}
+
+function positionRankOf(code: string): number {
+  const rank = POSITIONS.findIndex((p) => p.code === code);
+  if (rank < 0) throw new Error(`roster: cargo desconocido "${code}"`);
+  return rank;
+}
+
+/** Verifica las invariantes del organigrama (ver `ORG_CHART`). Lanza al primer incumplimiento. */
+function assertOrgChart(): void {
+  if (ORG_CHART.length !== ROSTER_SIZE) {
+    throw new Error(`roster: ORG_CHART tiene ${ORG_CHART.length} filas y ROSTER_SIZE es ${ROSTER_SIZE}`);
+  }
+  ORG_CHART.forEach(([deptCode, positionCode, sup], i) => {
+    departmentOf(deptCode);
+    if (deptCode === "OPE") throw new Error(`roster: índice ${i} en OPE (debe quedar vacío)`);
+    const rank = positionRankOf(positionCode);
+    if (sup === null) {
+      if (i !== ROOT_INDEX) throw new Error(`roster: índice ${i} sin jefe (la única raíz es ${ROOT_INDEX})`);
+      return;
+    }
+    if (i === ROOT_INDEX) throw new Error(`roster: la raíz ${ROOT_INDEX} no puede tener jefe`);
+    if (!(sup >= 0 && sup < i)) throw new Error(`roster: el jefe de ${i} (${sup}) debe tener índice menor`);
+    if (isTerminatedIndex(sup)) throw new Error(`roster: el jefe de ${i} (${sup}) está dado de baja`);
+    const [supDept, supPosition] = ORG_CHART[sup];
+    // La raíz (Gerente General) está por encima de todos, también de los Gerentes de departamento.
+    if (sup !== ROOT_INDEX && positionRankOf(supPosition) >= rank) {
+      throw new Error(`roster: el jefe de ${i} (${supPosition}) no tiene rango superior a ${positionCode}`);
+    }
+    if (supDept !== deptCode && sup !== ROOT_INDEX) {
+      throw new Error(`roster: ${i} (${deptCode}) reporta a ${sup} de otro departamento (${supDept})`);
+    }
+  });
+}
 
 export const departmentIdOf = (slug: string, code: string): string =>
   deterministicUuid(`${slug}:dept:${code}`);
@@ -108,24 +213,24 @@ function isoDate(baseYear: number, baseMonth: number, baseDay: number, addDays: 
 
 /**
  * Reconstruye el roster determinístico de un tenant. Reglas:
- * - índices 0–4 = cúpula (sin supervisor); 5–39 reportan a `i % 5`.
- * - índices 0–5 = ligados a los 6 usuarios (uno por rol); el resto sin cuenta (`user_id` null).
+ * - departamento, cargo y jefe salen de `ORG_CHART` (una sola raíz, jefes de rango superior).
+ * - índices 0–6 = ligados a los usuarios de `SEED_USER_DEFS`; el resto sin cuenta (`user_id` null).
  * - índices 36–39 = TERMINATED (con `terminationDate`); el resto ACTIVE.
- * - departamentos TEC/COM/ADM/RHH (OPE queda vacío); cargos rotando sobre los 8.
+ * - departamentos TEC/COM/ADM/RHH (OPE queda vacío).
  */
 export function buildRoster(tenant: SeedTenant): ReadonlyArray<SeedEmployee> {
+  assertOrgChart();
   faker.seed(seedFromSlug(tenant.slug));
-  const activeDepartments = DEPARTMENTS.slice(0, 4); // OPE (índice 4) se deja sin empleados
   const roster: SeedEmployee[] = [];
 
   for (let i = 0; i < ROSTER_SIZE; i += 1) {
     const firstName = faker.person.firstName();
     const lastName = faker.person.lastName();
-    const dept = activeDepartments[i % activeDepartments.length];
-    const position = POSITIONS[i % POSITIONS.length];
+    const [deptCode, positionCode, supervisorIndex] = ORG_CHART[i];
+    const dept = departmentOf(deptCode);
+    const position = POSITIONS[positionRankOf(positionCode)];
     const userKey = i < SEED_USER_DEFS.length ? SEED_USER_DEFS[i].key : null;
-    const isTerminated = i >= ROSTER_SIZE - 4;
-    const supervisorIndex = i < 5 ? null : i % 5;
+    const isTerminated = isTerminatedIndex(i);
 
     roster.push({
       id: employeeIdOf(tenant.slug, i),
